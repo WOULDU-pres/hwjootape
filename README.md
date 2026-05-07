@@ -15,6 +15,7 @@ It is meant for quick iteration: generate an image, annotate what should change,
 ## What the editor gives you
 
 - **Canvas annotations.** Draw boxes, arrows, pen marks, and sticky notes over the image before editing.
+- **Magic Layer.** Segment a generated or edited image into movable cutout layers so foreground elements and text-like regions can be dragged away or hidden.
 - **Project context.** Keep a system prompt and reference images attached to the project.
 - **Version history.** Save each generation or edit in the sidebar and reopen earlier results.
 - **Local project folders.** Store project metadata, references, and generated assets on disk.
@@ -46,7 +47,8 @@ Basic loop:
 3. Type a prompt and generate an image.
 4. Mark up the image with boxes, arrows, pen strokes, or sticky notes.
 5. Run an edit.
-6. Use the history sidebar to return to earlier results.
+6. For direct layout tweaks, click **Magic Layer**, select a detected element, then drag it or press Backspace to hide it.
+7. Use the history sidebar to return to earlier results.
 
 Useful commands:
 
@@ -88,6 +90,27 @@ bananatape launch logo-explorations
 ```
 
 If the auth file is missing or expired, the `codex` provider will fail until Codex CLI is signed in again.
+
+### Magic Layer segmentation (SAM3 on macOS)
+
+Magic Layer calls a local SAM3-compatible segmentation command when `BANANATAPE_SAM3_COMMAND` is set. The command should accept an input image path and output a JSON file containing `segments`, each with a `bbox` and optional `maskDataUrl` PNG data URL. Use `{input}` and `{output}` placeholders when your wrapper needs flags:
+
+```bash
+export BANANATAPE_SAM3_COMMAND="python3 /path/to/sam3_segment.py --input {input} --output {output}"
+bananatape launch logo-explorations
+```
+
+Expected output shape:
+
+```json
+{
+  "segments": [
+    { "id": "text-1", "label": "Text", "bbox": { "x": 120, "y": 80, "width": 320, "height": 90 }, "maskDataUrl": "data:image/png;base64,..." }
+  ]
+}
+```
+
+If the command is not configured, BananaTape uses a lightweight local fallback segmentation so the Magic Layer UI remains testable without downloading a model.
 
 ## Quick start for AI agents
 
@@ -140,6 +163,7 @@ Agent notes:
 ## What BananaTape does
 
 - Generate a new image from a prompt.
+- Segment a result with Magic Layer, then move or hide detected elements such as text regions.
 - Edit an image by drawing directly on the canvas.
 - Add sticky memo notes, arrows, and boxes to explain changes visually.
 - Attach reference images from the file picker or clipboard paste.
@@ -232,6 +256,7 @@ Common variables:
 BANANATAPE_PROJECTS_DIR   # optional project root override
 BANANATAPE_HOME           # optional CLI runtime/registry directory override
 OPENAI_API_KEY            # required for OpenAI provider calls
+BANANATAPE_SAM3_COMMAND   # optional local SAM3 segmentation command for Magic Layer
 ```
 
 The CLI sets these automatically for launched app instances:

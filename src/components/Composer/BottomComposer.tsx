@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef } from 'react';
-import { ImagePlus, Loader2, Minus, Plus, Wand2, Pencil, X, Undo2, Redo2 } from 'lucide-react';
+import { ImagePlus, Loader2, Minus, Plus, Wand2, Pencil, X, Undo2, Redo2, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
@@ -13,6 +13,7 @@ import { cn } from '@/lib/utils';
 import { countFocusedAnnotations, hasBusyFocusedBranches, isEditableGenerationSource } from '@/lib/generation/branch-busy';
 import type { Provider } from '@/types';
 import type { ReferenceImagePreview } from '@/components/Composer/types';
+import { useMagicLayers } from '@/hooks/useMagicLayers';
 
 function formatProviderLabel(provider: Provider) {
   return provider === 'god-tibo' ? 'codex' : 'OpenAI';
@@ -59,6 +60,7 @@ export function BottomComposer({
   const parallelCount = useEditorStore((s) => s.parallelCount);
   const incrementParallelCount = useEditorStore((s) => s.incrementParallelCount);
   const decrementParallelCount = useEditorStore((s) => s.decrementParallelCount);
+  const { activateMagicLayer, canActivateMagicLayer, isSegmenting } = useMagicLayers();
 
   const annotationCount = paths.length + boxes.length + memos.filter((memo) => memo.text.trim()).length + focusedAnnotationCount;
   const canEdit = !!baseImage || focusedReadyImageCount > 0;
@@ -110,6 +112,18 @@ export function BottomComposer({
               </Select>
             </div>
             <div className="flex items-center gap-1 rounded-xl border border-white/10 bg-[#1e1e1e] p-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-8 gap-1 px-2 text-xs text-[#b3b3b3] hover:bg-white/10 hover:text-white"
+                disabled={!canActivateMagicLayer || isSegmenting}
+                onClick={() => void activateMagicLayer()}
+                title="Segment selected image into draggable Magic Layers"
+              >
+                {isSegmenting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                Magic Layer
+              </Button>
               <Button type="button" size="icon-xs" variant="ghost" className="text-[#b3b3b3] hover:bg-white/10 hover:text-white" onClick={undo} disabled={!canUndo} aria-label="Undo" title={focusedImageIds.length === 1 ? "Undo selected image (Cmd/Ctrl+Z)" : "Select one image to undo"}>
                 <Undo2 className="h-3 w-3" />
               </Button>

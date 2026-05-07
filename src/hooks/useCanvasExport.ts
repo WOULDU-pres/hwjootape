@@ -15,6 +15,16 @@ function canvasToBlob(canvas: HTMLCanvasElement, type = 'image/png'): Promise<Bl
   });
 }
 
+function loadImageFromUrl(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
 function loadImageFromDataUrl(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -107,6 +117,28 @@ export function useCanvasExport() {
       memos: image.memos,
       naturalSize,
     });
+    const magicLayers = image.magicLayers ?? [];
+    const hasMagicLayers = Boolean(image.magicLayerBaseUrl && magicLayers.length > 0);
+    let magicComposite: Blob | null = null;
+    if (hasMagicLayers) {
+      const magicBaseImage = await loadImageFromUrl(image.magicLayerBaseUrl!);
+      const magicCanvas = overlayAnnotations({
+        baseImage: magicBaseImage,
+        paths: image.paths,
+        boxes: image.boxes,
+        memos: image.memos,
+        naturalSize,
+      });
+      const magicCtx = magicCanvas.getContext('2d');
+      if (magicCtx) {
+        for (const layer of magicLayers) {
+          if (layer.hidden) continue;
+          const layerImage = await loadImageFromUrl(layer.cutoutDataUrl);
+          magicCtx.drawImage(layerImage, layer.position.x, layer.position.y, layer.sourceBounds.width, layer.sourceBounds.height);
+        }
+      }
+      magicComposite = await canvasToBlob(magicCanvas);
+    }
     const maskCanvas = generateMask({
       paths: image.paths,
       boxes: image.boxes,
@@ -114,8 +146,8 @@ export function useCanvasExport() {
     });
 
     return {
-      original,
-      annotated: await canvasToBlob(annotatedCanvas),
+      original: magicComposite ?? original,
+      annotated: magicComposite ?? await canvasToBlob(annotatedCanvas),
       mask: await canvasToBlob(maskCanvas),
       size: naturalSize,
     };

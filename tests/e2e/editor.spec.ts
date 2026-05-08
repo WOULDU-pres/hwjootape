@@ -1049,36 +1049,30 @@ test.describe('BananaTape Editor', () => {
 
 
   test('Magic Layer segments generated image into draggable removable elements', async ({ page }) => {
-    await page.route('/api/magic-layer', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          success: true,
-          source: 'sam3',
-          segments: [
-            { id: 'headline', label: 'Detected text', bbox: { x: 10, y: 10, width: 40, height: 24 } },
-            { id: 'subject', label: 'Subject', bbox: { x: 45, y: 45, width: 42, height: 42 } },
-          ],
-        }),
-      });
-    });
-
     const promptInput = getPromptInput(page);
     await promptInput.fill('magic layer test');
     await getGenerateButton(page).click();
     await expect(page.getByAltText('Canvas base')).toHaveAttribute('src', FAKE_IMAGE_DATA_URL);
 
+    const magicResponse = page.waitForResponse((response) => response.url().includes('/api/magic-layer') && response.request().method() === 'POST');
     await page.locator('button[title="Segment selected image into draggable Magic Layers"]').click();
+    const response = await magicResponse;
+    expect(response.ok()).toBeTruthy();
+    const payload = await response.json();
+    expect(payload.source).toBe('fallback');
+    expect(payload.segments.length).toBeGreaterThan(0);
+
     const overlay = page.locator('[data-testid="magic-layer-overlay"]');
     await expect(overlay).toBeVisible();
-    await expect(page.locator('[data-testid="magic-layer-item"]')).toHaveCount(2);
+    await expect(page.locator('[data-testid="magic-layer-item"]')).toHaveCount(payload.segments.length);
 
     const magicTool = page.locator('button[title="Magic Layer (7)"]');
     await magicTool.click();
     await expect(magicTool).toHaveClass(/bg-/);
 
-    const layer = page.locator('[data-testid="magic-layer-item"][data-magic-layer-id="headline"]');
+    const firstLayerId = await page.locator('[data-testid="magic-layer-item"]').first().getAttribute('data-magic-layer-id');
+    if (!firstLayerId) throw new Error('Magic layer id missing');
+    const layer = page.locator(`[data-testid="magic-layer-item"][data-magic-layer-id="${firstLayerId}"]`);
     const before = await layer.boundingBox();
     if (!before) throw new Error('Magic layer was not visible');
     await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);

@@ -4,8 +4,10 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { NextResponse } from 'next/server';
+import { resolveSam3Command, startInstallInBackground, isAutoInstallSupported } from '@/lib/magic-layer/runner';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 const execFileAsync = promisify(execFile);
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -43,19 +45,17 @@ function sanitizeSegments(value: unknown): SegmentResponse[] {
   });
 }
 
-async function runSam3Command(image: File): Promise<SegmentResponse[] | null> {
-  const command = process.env.BANANATAPE_SAM3_COMMAND?.trim();
-  if (!command) return null;
-
+async function runSam3Command(image: File, argv: string[]): Promise<SegmentResponse[] | null> {
+  if (!argv.length) return null;
   const dir = await mkdtemp(path.join(/*turbopackIgnore: true*/ tmpdir(), 'bananatape-sam3-'));
   const inputPath = path.join(dir, 'input.png');
   const outputPath = path.join(dir, 'segments.json');
   try {
     await writeFile(inputPath, Buffer.from(await image.arrayBuffer()));
-    const [bin, ...configuredArgs] = command.split(/\s+/);
+    const [bin, ...configuredArgs] = argv;
     const args = configuredArgs.map((arg) => arg.replaceAll('{input}', inputPath).replaceAll('{output}', outputPath));
-    if (!args.some((arg) => arg.includes(inputPath))) args.push(inputPath);
-    if (!args.some((arg) => arg.includes(outputPath))) args.push(outputPath);
+    if (!args.some((arg) => arg.includes(inputPath))) args.push('--input', inputPath);
+    if (!args.some((arg) => arg.includes(outputPath))) args.push('--output', outputPath);
     await execFileAsync(bin, args, { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 });
     const parsed = JSON.parse(await readFile(outputPath, 'utf8'));
     const segments = sanitizeSegments(parsed);
@@ -88,12 +88,37 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'width and height are required' }, { status: 400 });
     }
 
-    const sam3Segments = await runSam3Command(image);
-    return NextResponse.json({
-      success: true,
-      source: sam3Segments ? 'sam3' : 'fallback',
-      segments: sam3Segments ?? fallbackSegments(width, height),
-    });
+    const resolved = await resolveSam3Command();
+
+    if (resolved.source === 'auto-mlx' && resolved.argv) {
+      const segments = await runSam3Command(image, resolved.argv);
+      return NextResponse.json({ success: true, source: 'sam3', segments: segments ?? fallbackSegments(width, height) });
+    }
+
+    if (resolved.source === 'env' && resolved.argv) {
+      const segments = await runSam3Command(image, resolved.argv);
+      return NextResponse.json({ success: true, source: 'sam3', segments: segments ?? fallbackSegments(width, height) });
+    }
+
+    if (isAutoInstallSupported()) {
+      const attempt = await startInstallInBackground();
+      if (attempt.status === 'started' || attempt.status === 'already-installing') {
+        return NextResponse.json(
+          { success: false, setupRequired: true, setupStatus: attempt.status, message: attempt.message },
+          { status: 202, headers: { 'Cache-Control': 'no-store' } },
+        );
+      }
+      if (attempt.status === 'missing-uv' || attempt.status === 'failed') {
+        return NextResponse.json({
+          success: true,
+          source: 'fallback',
+          segments: fallbackSegments(width, height),
+          setupHint: { errorCode: attempt.errorCode, message: attempt.message },
+        });
+      }
+    }
+
+    return NextResponse.json({ success: true, source: 'fallback', segments: fallbackSegments(width, height) });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Magic Layer segmentation failed';
     return NextResponse.json({ error: message }, { status: 500 });

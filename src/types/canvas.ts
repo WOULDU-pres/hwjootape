@@ -13,7 +13,7 @@ export interface MagicLayer {
   hidden: boolean;
 }
 
-export type MagicLayerStatus = 'idle' | 'segmenting' | 'ready' | 'error';
+export type MagicLayerStatus = 'idle' | 'preparing' | 'segmenting' | 'ready' | 'error';
 
 export interface CanvasImage {
   id: string;

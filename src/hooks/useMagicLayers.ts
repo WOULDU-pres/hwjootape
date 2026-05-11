@@ -17,6 +17,43 @@ interface MagicLayerApiResponse {
   source?: 'sam3' | 'fallback';
   segments?: MagicLayerSegment[];
   error?: string;
+  setupRequired?: boolean;
+  setupStatus?: string;
+  message?: string;
+  setupHint?: { errorCode?: string; message?: string };
+}
+
+interface MagicLayerStatusResponse {
+  installed: boolean;
+  installing: boolean;
+  failed: boolean;
+  autoInstallSupported: boolean;
+  message?: string;
+  canFallback?: boolean;
+}
+
+const SETUP_POLL_INTERVAL_MS = 4000;
+const SETUP_POLL_MAX_ATTEMPTS = 600;
+
+async function waitForSetup(imageId: string): Promise<'ready' | 'failed' | 'unsupported'> {
+  const store = useCanvasStore.getState();
+  for (let attempt = 0; attempt < SETUP_POLL_MAX_ATTEMPTS; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, SETUP_POLL_INTERVAL_MS));
+    let payload: MagicLayerStatusResponse;
+    try {
+      const res = await fetch('/api/magic-layer/status', { cache: 'no-store' });
+      payload = await res.json() as MagicLayerStatusResponse;
+    } catch {
+      continue;
+    }
+    if (!payload.autoInstallSupported) return 'unsupported';
+    if (payload.failed) return 'failed';
+    if (payload.installed) return 'ready';
+    if (payload.message) {
+      store.setMagicLayerStatus(imageId, 'preparing', payload.message);
+    }
+  }
+  return 'failed';
 }
 
 export function useMagicLayers() {
@@ -24,7 +61,9 @@ export function useMagicLayers() {
   const focusedImage = useCanvasStore((s) => s.focusedImageIds.length === 1 ? s.images[s.focusedImageIds[0]] : undefined);
 
   const canActivateMagicLayer = Boolean(focusedImage && focusedImage.status === 'ready' && focusedImage.size.width > 0 && focusedImage.size.height > 0);
+  const isPreparing = focusedImage?.magicLayerStatus === 'preparing';
   const isSegmenting = focusedImage?.magicLayerStatus === 'segmenting';
+  const isBusy = isPreparing || isSegmenting;
 
   const activateMagicLayer = useCallback(async () => {
     const imageId = focusedImageIds.length === 1 ? focusedImageIds[0] : null;
@@ -35,13 +74,29 @@ export function useMagicLayers() {
     const store = useCanvasStore.getState();
     store.setMagicLayerStatus(imageId, 'segmenting');
     try {
-      const file = await imageUrlToFile(image.url);
-      const formData = new FormData();
+      let file = await imageUrlToFile(image.url);
+      let formData = new FormData();
       formData.set('image', file);
       formData.set('width', String(image.size.width));
       formData.set('height', String(image.size.height));
 
-      const response = await fetch('/api/magic-layer', { method: 'POST', body: formData });
+      let response = await fetch('/api/magic-layer', { method: 'POST', body: formData });
+
+      if (response.status === 202) {
+        const setupPayload = await response.json() as MagicLayerApiResponse;
+        store.setMagicLayerStatus(imageId, 'preparing', setupPayload.message ?? 'Preparing AI model for first-time use…');
+        const outcome = await waitForSetup(imageId);
+        if (outcome === 'failed') throw new Error('Magic Layer setup failed. See server logs for details.');
+        if (outcome === 'unsupported') throw new Error('Auto-install not supported on this platform.');
+        store.setMagicLayerStatus(imageId, 'segmenting');
+        file = await imageUrlToFile(image.url);
+        formData = new FormData();
+        formData.set('image', file);
+        formData.set('width', String(image.size.width));
+        formData.set('height', String(image.size.height));
+        response = await fetch('/api/magic-layer', { method: 'POST', body: formData });
+      }
+
       const payload = await response.json() as MagicLayerApiResponse;
       if (!response.ok || !payload.segments?.length) {
         throw new Error(payload.error || 'Magic Layer did not find movable elements');
@@ -61,5 +116,5 @@ export function useMagicLayers() {
     }
   }, [focusedImageIds]);
 
-  return { activateMagicLayer, canActivateMagicLayer, isSegmenting };
+  return { activateMagicLayer, canActivateMagicLayer, isSegmenting, isPreparing, isBusy };
 }

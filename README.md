@@ -91,20 +91,48 @@ bananatape launch logo-explorations
 
 If the auth file is missing or expired, the `codex` provider will fail until Codex CLI is signed in again.
 
-### Magic Layer segmentation (SAM3 on macOS)
+### Magic Layer segmentation
 
-Magic Layer calls a local SAM3-compatible segmentation command when `BANANATAPE_SAM3_COMMAND` is set. BananaTape includes a wrapper at `scripts/sam3-magic-layer.py` that adapts Meta's official `facebookresearch/sam3` Python API to the JSON contract used by the editor.
+Magic Layer turns a generated image into draggable cutouts. BananaTape picks the segmentation backend automatically by platform.
 
-> Note: the official SAM 3 setup currently expects a separate Python/SAM 3 environment. Install and validate SAM 3 outside BananaTape first; the npm package does not bundle model weights or Python dependencies.
+**macOS Apple Silicon (M1/M2/M3/M4) — zero-config auto-install**
 
-Example wrapper setup after SAM 3 works locally:
+On the first Magic Layer click, BananaTape:
+
+1. Detects `darwin` + `arm64`.
+2. Creates a managed Python 3.13 virtualenv under `~/.bananatape/mlx_sam3/.venv`.
+3. Installs the lean MLX runtime (`mlx`, `torch`, `torchvision`, `pillow`, `huggingface-hub`, ...).
+4. Installs [`Deekshith-Dade/mlx_sam3`](https://github.com/Deekshith-Dade/mlx_sam3) from source.
+5. Caches everything; subsequent runs skip the install path entirely.
+
+The button shows **"Preparing AI…"** during the one-time setup (~5–15 min depending on bandwidth, ~4 GB on disk). Until the install finishes, BananaTape falls back to lightweight segmentation so the UI stays usable.
+
+Prerequisite: install [`uv`](https://docs.astral.sh/uv/) once. If `uv` is not on `PATH`, BananaTape returns fallback cutouts and the API response contains a `setupHint` with the install command:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Opt out of auto-install (CI, tests, custom setups):
+
+```bash
+export BANANATAPE_DISABLE_AUTO_INSTALL=1
+```
+
+`CI=true` also disables auto-install automatically.
+
+**Linux / NVIDIA CUDA — official SAM 3**
+
+On non-Apple platforms, set `BANANATAPE_SAM3_COMMAND` to point at the official `scripts/sam3-magic-layer.py` wrapper after installing [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) in a separate environment:
 
 ```bash
 export BANANATAPE_SAM3_COMMAND="python3 /path/to/bananatape/scripts/sam3-magic-layer.py --prompts text,logo,person,product,object --input {input} --output {output}"
 bananatape launch logo-explorations
 ```
 
-The command may also be any custom script that accepts an input image path and writes a JSON file containing `segments`, each with a `bbox` and optional full-image `maskDataUrl` PNG data URL:
+**Custom backend**
+
+`BANANATAPE_SAM3_COMMAND` accepts any command that takes `--input <image>` `--output <json>` and writes:
 
 ```json
 {
@@ -114,7 +142,7 @@ The command may also be any custom script that accepts an input image path and w
 }
 ```
 
-If the command is not configured, BananaTape uses a lightweight local fallback segmentation so the Magic Layer UI remains testable without downloading a model.
+If neither auto-install nor an explicit command is available, BananaTape uses a lightweight local fallback so the Magic Layer UI remains testable.
 
 ## Quick start for AI agents
 
@@ -257,10 +285,12 @@ In this mode, BananaTape still works as an editor, but project persistence is on
 Common variables:
 
 ```bash
-BANANATAPE_PROJECTS_DIR   # optional project root override
-BANANATAPE_HOME           # optional CLI runtime/registry directory override
-OPENAI_API_KEY            # required for OpenAI provider calls
-BANANATAPE_SAM3_COMMAND   # optional local SAM3 segmentation command for Magic Layer
+BANANATAPE_PROJECTS_DIR        # optional project root override
+BANANATAPE_HOME                # optional CLI runtime/registry directory override
+OPENAI_API_KEY                 # required for OpenAI provider calls
+BANANATAPE_SAM3_COMMAND        # optional explicit SAM3-compatible command for Magic Layer
+BANANATAPE_DISABLE_AUTO_INSTALL # set to 1 to skip the macOS mlx_sam3 auto-install
+BANANATAPE_UV_PATH             # optional absolute path to a uv binary (default: PATH search)
 ```
 
 The CLI sets these automatically for launched app instances:

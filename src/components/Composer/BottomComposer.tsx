@@ -60,7 +60,7 @@ export function BottomComposer({
   const parallelCount = useEditorStore((s) => s.parallelCount);
   const incrementParallelCount = useEditorStore((s) => s.incrementParallelCount);
   const decrementParallelCount = useEditorStore((s) => s.decrementParallelCount);
-  const { activateMagicLayer, canActivateMagicLayer, isSegmenting } = useMagicLayers();
+  const { activateMagicLayer, canActivateMagicLayer, isSegmenting, isPreparing, isBusy } = useMagicLayers();
 
   const annotationCount = paths.length + boxes.length + memos.filter((memo) => memo.text.trim()).length + focusedAnnotationCount;
   const canEdit = !!baseImage || focusedReadyImageCount > 0;
@@ -117,12 +117,13 @@ export function BottomComposer({
                 size="sm"
                 variant="ghost"
                 className="h-8 gap-1 px-2 text-xs text-[#b3b3b3] hover:bg-white/10 hover:text-white"
-                disabled={!canActivateMagicLayer || isSegmenting}
+                disabled={!canActivateMagicLayer || isBusy}
                 onClick={() => void activateMagicLayer()}
-                title="Segment selected image into draggable Magic Layers"
+                title={isPreparing ? 'First-time setup: downloading AI model (~3–4 GB)…' : 'Segment selected image into draggable Magic Layers'}
+                data-state={isPreparing ? 'preparing' : isSegmenting ? 'segmenting' : 'idle'}
               >
-                {isSegmenting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
-                Magic Layer
+                {isBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                {isPreparing ? 'Preparing AI…' : 'Magic Layer'}
               </Button>
               <Button type="button" size="icon-xs" variant="ghost" className="text-[#b3b3b3] hover:bg-white/10 hover:text-white" onClick={undo} disabled={!canUndo} aria-label="Undo" title={focusedImageIds.length === 1 ? "Undo selected image (Cmd/Ctrl+Z)" : "Select one image to undo"}>
                 <Undo2 className="h-3 w-3" />

@@ -21,5 +21,8 @@ export default defineConfig({
     command: 'npm run dev -- -p 4567',
     url: 'http://localhost:4567',
     reuseExistingServer: !process.env.CI,
+    env: {
+      BANANATAPE_DISABLE_AUTO_INSTALL: '1',
+    },
   },
 });

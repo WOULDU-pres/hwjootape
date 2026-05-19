@@ -54,6 +54,15 @@ export function useKeyboardShortcuts() {
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
         const canvasState = useCanvasStore.getState();
+        if (state.activeTool === 'magic-layer' && canvasState.focusedImageIds.length === 1) {
+          const imageId = canvasState.focusedImageIds[0];
+          const selectedLayerId = canvasState.images[imageId]?.selectedMagicLayerId;
+          if (selectedLayerId) {
+            e.preventDefault();
+            canvasState.hideMagicLayer(imageId, selectedLayerId);
+            return;
+          }
+        }
         if (canvasState.focusedImageIds.length > 0) {
           e.preventDefault();
           const count = canvasState.focusedImageIds.length;
@@ -96,6 +105,12 @@ export function useKeyboardShortcuts() {
       if (e.key === '6') {
         e.preventDefault();
         state.setActiveTool('move');
+        return;
+      }
+
+      if (e.key === '7') {
+        e.preventDefault();
+        state.setActiveTool('magic-layer');
         return;
       }
 

@@ -225,6 +225,41 @@ describe('useCanvasStore', () => {
     expect(useCanvasStore.getState().images.a.memos).toEqual([{ ...memo, text: '' }]);
   });
 
+
+  it('stores, moves, hides, and clears Magic Layers with image undo support', () => {
+    useCanvasStore.getState().addImage(makeImage('a'));
+    const layer = {
+      id: 'layer-1',
+      name: 'Text',
+      maskDataUrl: 'data:image/png;base64,mask',
+      cutoutDataUrl: 'data:image/png;base64,cutout',
+      sourceBounds: { x: 10, y: 20, width: 100, height: 40 },
+      position: { x: 10, y: 20 },
+      hidden: false,
+    };
+
+    useCanvasStore.getState().setMagicLayers('a', [layer], 'data:image/png;base64,base');
+    expect(useCanvasStore.getState().images.a).toMatchObject({
+      magicLayerStatus: 'ready',
+      magicLayerBaseUrl: 'data:image/png;base64,base',
+      selectedMagicLayerId: 'layer-1',
+    });
+
+    useCanvasStore.getState().updateMagicLayer('a', 'layer-1', { position: { x: 80, y: 90 } });
+    expect(useCanvasStore.getState().images.a.magicLayers?.[0].position).toEqual({ x: 80, y: 90 });
+
+    useCanvasStore.getState().hideMagicLayer('a', 'layer-1');
+    expect(useCanvasStore.getState().images.a.magicLayers?.[0].hidden).toBe(true);
+    expect(useCanvasStore.getState().images.a.selectedMagicLayerId).toBeNull();
+
+    useCanvasStore.getState().undoImage('a');
+    expect(useCanvasStore.getState().images.a.magicLayers?.[0].hidden).toBe(false);
+
+    useCanvasStore.getState().clearMagicLayers('a');
+    expect(useCanvasStore.getState().images.a.magicLayers).toEqual([]);
+    expect(useCanvasStore.getState().images.a.magicLayerBaseUrl).toBeUndefined();
+  });
+
   it('setImageStatus does not push an undo entry', () => {
     useCanvasStore.getState().addImage(makeImage('a', 'pending'));
     const before = pastLength();

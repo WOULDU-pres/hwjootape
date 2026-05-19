@@ -1,11 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, RefreshCw, X } from 'lucide-react';
+import { EyeOff, Loader2, RefreshCw, Wand2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CanvasContextMenu } from './CanvasContextMenu';
 import { useCanvasDrawingPerImage } from '@/hooks/useCanvasDrawingPerImage';
 import { useImageDrag } from '@/hooks/useImageDrag';
+import { hasMagicLayerChanges } from '@/lib/canvas/magic-layer-changes';
+import { useMagicLayerApply } from '@/hooks/useMagicLayerApply';
 import {
   ACTIVE_BOX_STROKE_WIDTH,
   createCanvasMapper,
@@ -18,7 +20,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useCanvasStore } from '@/stores/useCanvasStore';
 import { useEditorStore } from '@/stores/useEditorStore';
-import { DEFAULT_PLACEHOLDER_LAYOUT, type CanvasImage } from '@/types/canvas';
+import { DEFAULT_PLACEHOLDER_LAYOUT, type CanvasImage, type MagicLayer } from '@/types/canvas';
 
 interface CanvasImageItemProps {
   image: CanvasImage;
@@ -145,11 +147,173 @@ function ScopedMemoOverlay({ image, isFocused }: { image: CanvasImage; isFocused
   );
 }
 
+
+function MagicLayerOverlay({ image, enabled }: { image: CanvasImage; enabled: boolean }) {
+  const [draggingLayerId, setDraggingLayerId] = useState<string | null>(null);
+  const [livePositions, setLivePositions] = useState<Record<string, { x: number; y: number }>>({});
+  const livePositionsRef = useRef<Record<string, { x: number; y: number }>>({});
+  const dragStartRef = useRef<{ layerId: string; pointerId: number; clientX: number; clientY: number; startX: number; startY: number } | null>(null);
+  const layers = image.magicLayers ?? [];
+
+  const { apply } = useMagicLayerApply();
+  const [isApplying, setIsApplying] = useState(false);
+  const changesPending = hasMagicLayerChanges(image);
+  const canApply = enabled && changesPending && image.status === 'ready' && !isApplying;
+  const handleApply = useCallback(async (event: React.MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!canApply) return;
+    setIsApplying(true);
+    try {
+      await apply(image.id);
+    } finally {
+      setIsApplying(false);
+    }
+  }, [apply, canApply, image.id]);
+
+  const startDrag = useCallback((event: React.PointerEvent, layer: MagicLayer) => {
+    if (!enabled || layer.hidden) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is unavailable in some test environments.
+    }
+    useCanvasStore.getState().selectMagicLayer(image.id, layer.id);
+    dragStartRef.current = {
+      layerId: layer.id,
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      startX: layer.position.x,
+      startY: layer.position.y,
+    };
+    setDraggingLayerId(layer.id);
+  }, [enabled, image.id]);
+
+  const moveDrag = useCallback((event: React.PointerEvent) => {
+    const start = dragStartRef.current;
+    if (!start || event.pointerId !== start.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const zoom = useCanvasStore.getState().viewport.zoom || 1;
+    const next = {
+      x: start.startX + (event.clientX - start.clientX) / zoom,
+      y: start.startY + (event.clientY - start.clientY) / zoom,
+    };
+    livePositionsRef.current = { ...livePositionsRef.current, [start.layerId]: next };
+    setLivePositions(livePositionsRef.current);
+  }, []);
+
+  const endDrag = useCallback((event: React.PointerEvent) => {
+    const start = dragStartRef.current;
+    if (!start || event.pointerId !== start.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // See pointerdown.
+    }
+    const finalPosition = livePositionsRef.current[start.layerId];
+    if (finalPosition) {
+      useCanvasStore.getState().updateMagicLayer(image.id, start.layerId, { position: finalPosition });
+    }
+    dragStartRef.current = null;
+    setDraggingLayerId(null);
+    const nextLivePositions = { ...livePositionsRef.current };
+    delete nextLivePositions[start.layerId];
+    livePositionsRef.current = nextLivePositions;
+    setLivePositions(nextLivePositions);
+  }, [image.id]);
+
+  if (layers.length === 0) return null;
+
+  return (
+    <div className="absolute inset-0" data-testid="magic-layer-overlay" style={{ pointerEvents: enabled ? 'auto' : 'none' }}>
+      {layers.map((layer) => {
+        if (layer.hidden) return null;
+        const isSelected = image.selectedMagicLayerId === layer.id;
+        const position = livePositions[layer.id] ?? layer.position;
+        return (
+          <div
+            key={layer.id}
+            data-testid="magic-layer-item"
+            data-magic-layer-id={layer.id}
+            className={cn(
+              'group/magic absolute rounded-md',
+              isSelected ? 'ring-2 ring-fuchsia-400 ring-offset-2 ring-offset-transparent' : enabled ? 'hover:ring-2 hover:ring-white/80' : '',
+            )}
+            style={{
+              left: position.x,
+              top: position.y,
+              width: layer.sourceBounds.width,
+              height: layer.sourceBounds.height,
+              cursor: enabled ? (draggingLayerId === layer.id ? 'grabbing' : 'grab') : undefined,
+              touchAction: enabled ? 'none' : undefined,
+            }}
+            title={layer.name}
+            onPointerDown={(event) => startDrag(event, layer)}
+            onPointerMove={moveDrag}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+          >
+            <img src={layer.cutoutDataUrl} alt={layer.name} className="block h-full w-full select-none object-contain" draggable={false} />
+            {enabled && isSelected && (
+              <button
+                type="button"
+                aria-label={`Hide ${layer.name}`}
+                className="absolute -right-2 -top-2 z-50 flex h-6 w-6 items-center justify-center rounded-full bg-fuchsia-600 text-white shadow-lg"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  useCanvasStore.getState().hideMagicLayer(image.id, layer.id);
+                }}
+              >
+                <EyeOff className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        );
+      })}
+      {enabled && (changesPending || isApplying) && (
+        <button
+          type="button"
+          data-testid="magic-layer-apply"
+          aria-label="Apply Magic Layer changes"
+          disabled={!canApply}
+          onClick={handleApply}
+          className={cn(
+            'absolute right-11 top-2 z-50 flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-xl ring-1 ring-fuchsia-300/40 backdrop-blur transition-all',
+            canApply
+              ? 'bg-fuchsia-600 text-white hover:bg-fuchsia-500 hover:shadow-fuchsia-500/30'
+              : 'bg-fuchsia-600/60 text-white/80 cursor-not-allowed opacity-60',
+          )}
+        >
+          {isApplying ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Applying…
+            </>
+          ) : (
+            <>
+              <Wand2 className="h-3.5 w-3.5" />
+              Apply
+            </>
+          )}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function CanvasImageItem({ image, isFocused, isVisible, onFocus, onDelete, onRetry }: CanvasImageItemProps) {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const size = getImageSize(image);
   const activeTool = useEditorStore((s) => s.activeTool);
   const moveEnabled = activeTool === 'move';
+  const magicLayerEnabled = activeTool === 'magic-layer' && isFocused;
   const drag = useImageDrag(image, { enabled: moveEnabled });
   const suppressClickRef = useRef(false);
 
@@ -231,8 +395,9 @@ export function CanvasImageItem({ image, isFocused, isVisible, onFocus, onDelete
 
       {isVisible && (image.status === 'ready' || image.status === 'streaming') && (
         <>
-          <img src={image.url} alt="Canvas base" className="block select-none" style={{ width: size.width, height: size.height, maxWidth: 'none', maxHeight: 'none' }} decoding="async" loading="lazy" draggable={false} />
-          {isFocused && <ScopedDrawingLayer image={image} />}
+          <img src={image.magicLayerBaseUrl ?? image.url} alt="Canvas base" className="block select-none" style={{ width: size.width, height: size.height, maxWidth: 'none', maxHeight: 'none' }} decoding="async" loading="lazy" draggable={false} />
+          <MagicLayerOverlay image={image} enabled={magicLayerEnabled} />
+          {isFocused && !magicLayerEnabled && <ScopedDrawingLayer image={image} />}
           <ScopedMemoOverlay image={image} isFocused={isFocused} />
         </>
       )}

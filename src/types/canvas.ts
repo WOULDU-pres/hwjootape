@@ -3,6 +3,18 @@ import type { DrawingPath, BoundingBox, TextMemo } from './index';
 
 export type GenerationStatus = 'pending' | 'streaming' | 'ready' | 'error';
 
+export interface MagicLayer {
+  id: string;
+  name: string;
+  maskDataUrl: string;
+  cutoutDataUrl: string;
+  sourceBounds: { x: number; y: number; width: number; height: number };
+  position: { x: number; y: number };
+  hidden: boolean;
+}
+
+export type MagicLayerStatus = 'idle' | 'preparing' | 'segmenting' | 'ready' | 'error';
+
 export interface CanvasImage {
   id: string;
   url: string;
@@ -18,6 +30,10 @@ export interface CanvasImage {
   paths: DrawingPath[];
   boxes: BoundingBox[];
   memos: TextMemo[];
+  magicLayers?: MagicLayer[];
+  magicLayerBaseUrl?: string;
+  magicLayerStatus?: MagicLayerStatus;
+  selectedMagicLayerId?: string | null;
   status: GenerationStatus;
   error?: string;
 }

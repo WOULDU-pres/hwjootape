@@ -15,6 +15,7 @@ It is meant for quick iteration: generate an image, annotate what should change,
 ## What the editor gives you
 
 - **Canvas annotations.** Draw boxes, arrows, pen marks, and sticky notes over the image before editing.
+- **Magic Layer.** Segment a generated or edited image into movable cutout layers so foreground elements and text-like regions can be dragged away or hidden.
 - **Project context.** Keep a system prompt and reference images attached to the project.
 - **Version history.** Save each generation or edit in the sidebar and reopen earlier results.
 - **Local project folders.** Store project metadata, references, and generated assets on disk.
@@ -46,7 +47,8 @@ Basic loop:
 3. Type a prompt and generate an image.
 4. Mark up the image with boxes, arrows, pen strokes, or sticky notes.
 5. Run an edit.
-6. Use the history sidebar to return to earlier results.
+6. For direct layout tweaks, click **Magic Layer**, select a detected element, then drag it or press Backspace to hide it.
+7. Use the history sidebar to return to earlier results.
 
 Useful commands:
 
@@ -88,6 +90,59 @@ bananatape launch logo-explorations
 ```
 
 If the auth file is missing or expired, the `codex` provider will fail until Codex CLI is signed in again.
+
+### Magic Layer segmentation
+
+Magic Layer turns a generated image into draggable cutouts. BananaTape picks the segmentation backend automatically by platform.
+
+**macOS Apple Silicon (M1/M2/M3/M4) — zero-config auto-install**
+
+On the first Magic Layer click, BananaTape:
+
+1. Detects `darwin` + `arm64`.
+2. Creates a managed Python 3.13 virtualenv under `~/.bananatape/mlx_sam3/.venv`.
+3. Installs the lean MLX runtime (`mlx`, `torch`, `torchvision`, `pillow`, `huggingface-hub`, ...).
+4. Installs [`Deekshith-Dade/mlx_sam3`](https://github.com/Deekshith-Dade/mlx_sam3) from source.
+5. Caches everything; subsequent runs skip the install path entirely.
+
+The button shows **"Preparing AI…"** during the one-time setup (~5–15 min depending on bandwidth, ~4 GB on disk). Until the install finishes, BananaTape falls back to lightweight segmentation so the UI stays usable.
+
+Prerequisite: install [`uv`](https://docs.astral.sh/uv/) once. If `uv` is not on `PATH`, BananaTape returns fallback cutouts and the API response contains a `setupHint` with the install command:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Opt out of auto-install (CI, tests, custom setups):
+
+```bash
+export BANANATAPE_DISABLE_AUTO_INSTALL=1
+```
+
+`CI=true` also disables auto-install automatically.
+
+**Linux / NVIDIA CUDA — official SAM 3**
+
+On non-Apple platforms, set `BANANATAPE_SAM3_COMMAND` to point at the official `scripts/sam3-magic-layer.py` wrapper after installing [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) in a separate environment:
+
+```bash
+export BANANATAPE_SAM3_COMMAND="python3 /path/to/bananatape/scripts/sam3-magic-layer.py --prompts text,logo,person,product,object --input {input} --output {output}"
+bananatape launch logo-explorations
+```
+
+**Custom backend**
+
+`BANANATAPE_SAM3_COMMAND` accepts any command that takes `--input <image>` `--output <json>` and writes:
+
+```json
+{
+  "segments": [
+    { "id": "text-1", "label": "Text", "bbox": { "x": 120, "y": 80, "width": 320, "height": 90 }, "maskDataUrl": "data:image/png;base64,..." }
+  ]
+}
+```
+
+If neither auto-install nor an explicit command is available, BananaTape uses a lightweight local fallback so the Magic Layer UI remains testable.
 
 ## Quick start for AI agents
 
@@ -140,6 +195,7 @@ Agent notes:
 ## What BananaTape does
 
 - Generate a new image from a prompt.
+- Segment a result with Magic Layer, then move or hide detected elements such as text regions.
 - Edit an image by drawing directly on the canvas.
 - Add sticky memo notes, arrows, and boxes to explain changes visually.
 - Attach reference images from the file picker or clipboard paste.
@@ -229,9 +285,12 @@ In this mode, BananaTape still works as an editor, but project persistence is on
 Common variables:
 
 ```bash
-BANANATAPE_PROJECTS_DIR   # optional project root override
-BANANATAPE_HOME           # optional CLI runtime/registry directory override
-OPENAI_API_KEY            # required for OpenAI provider calls
+BANANATAPE_PROJECTS_DIR        # optional project root override
+BANANATAPE_HOME                # optional CLI runtime/registry directory override
+OPENAI_API_KEY                 # required for OpenAI provider calls
+BANANATAPE_SAM3_COMMAND        # optional explicit SAM3-compatible command for Magic Layer
+BANANATAPE_DISABLE_AUTO_INSTALL # set to 1 to skip the macOS mlx_sam3 auto-install
+BANANATAPE_UV_PATH             # optional absolute path to a uv binary (default: PATH search)
 ```
 
 The CLI sets these automatically for launched app instances:

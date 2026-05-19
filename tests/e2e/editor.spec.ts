@@ -511,6 +511,7 @@ test.describe('BananaTape Editor', () => {
     const boxBtn = page.locator('button[title="Box (3)"]');
     const arrowBtn = page.locator('button[title="Arrow (4)"]');
     const memoBtn = page.locator('button[title="Sticky memo (5)"]');
+    const magicBtn = page.locator('button[title="Magic Layer (7)"]');
     await penBtn.click();
     await expect(penBtn).toHaveClass(/bg-/);
 
@@ -523,6 +524,8 @@ test.describe('BananaTape Editor', () => {
     await memoBtn.click();
     await expect(memoBtn).toHaveClass(/bg-/);
 
+    await magicBtn.click();
+    await expect(magicBtn).toHaveClass(/bg-/);
 
     await page.keyboard.press('1');
     await expect(panBtn).toHaveClass(/bg-/);
@@ -535,6 +538,9 @@ test.describe('BananaTape Editor', () => {
 
     await page.keyboard.press('5');
     await expect(memoBtn).toHaveClass(/bg-/);
+
+    await page.keyboard.press('7');
+    await expect(magicBtn).toHaveClass(/bg-/);
 
     await page.keyboard.press('Escape');
     await expect(panBtn).toHaveClass(/bg-/);
@@ -1041,6 +1047,142 @@ test.describe('BananaTape Editor', () => {
     await expect(page.locator('[data-testid="composer-reference-list"]')).toBeVisible();
   });
 
+
+  test('Magic Layer segments generated image into draggable removable elements', async ({ page }) => {
+    const promptInput = getPromptInput(page);
+    await promptInput.fill('magic layer test');
+    await getGenerateButton(page).click();
+    await expect(page.getByAltText('Canvas base')).toHaveAttribute('src', FAKE_IMAGE_DATA_URL);
+
+    const magicResponse = page.waitForResponse((response) => response.url().includes('/api/magic-layer') && response.request().method() === 'POST');
+    await page.locator('button[title="Segment selected image into draggable Magic Layers"]').click();
+    const response = await magicResponse;
+    expect(response.ok()).toBeTruthy();
+    const payload = await response.json();
+    expect(payload.source).toBe('fallback');
+    expect(payload.segments.length).toBeGreaterThan(0);
+
+    const overlay = page.locator('[data-testid="magic-layer-overlay"]');
+    await expect(overlay).toBeVisible();
+    await expect(page.locator('[data-testid="magic-layer-item"]')).toHaveCount(payload.segments.length);
+
+    const magicTool = page.locator('button[title="Magic Layer (7)"]');
+    await magicTool.click();
+    await expect(magicTool).toHaveClass(/bg-/);
+
+    const firstLayerId = await page.locator('[data-testid="magic-layer-item"]').first().getAttribute('data-magic-layer-id');
+    if (!firstLayerId) throw new Error('Magic layer id missing');
+    const layer = page.locator(`[data-testid="magic-layer-item"][data-magic-layer-id="${firstLayerId}"]`);
+    const before = await layer.boundingBox();
+    if (!before) throw new Error('Magic layer was not visible');
+    await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(before.x + before.width / 2 + 60, before.y + before.height / 2 + 30, { steps: 6 });
+    await page.mouse.up();
+
+    await expect.poll(async () => {
+      const after = await layer.boundingBox();
+      return after ? Math.round(after.x - before.x) : 0;
+    }).toBeGreaterThan(20);
+
+    await page.keyboard.press('Backspace');
+    await expect(layer).toHaveCount(0);
+  });
+
+  test('Magic Layer Apply triggers an edit generation with the moved composition', async ({ page }) => {
+    let editRequestCount = 0;
+    let capturedEditPrompt: string | null = null;
+    let capturedEditFormDataKeys: string[] = [];
+
+    await page.unroute('/api/edit');
+    await page.route('/api/edit', async (route) => {
+      editRequestCount += 1;
+      const post = route.request().postData() ?? '';
+      const promptMatch = post.match(/name="prompt"\r?\n\r?\n([\s\S]*?)(?=\r?\n--)/);
+      if (promptMatch) capturedEditPrompt = promptMatch[1];
+      const fieldRe = /name="([^"]+)"/g;
+      const names: string[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = fieldRe.exec(post)) !== null) names.push(m[1]);
+      capturedEditFormDataKeys = names;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          imageDataUrl: FAKE_IMAGE_DATA_URL,
+          prompt: 'edited via magic layer',
+          provider: 'openai',
+        }),
+      });
+    });
+
+    const promptInput = getPromptInput(page);
+    await promptInput.fill('magic layer apply test');
+    await getGenerateButton(page).click();
+    await expect(page.getByAltText('Canvas base')).toHaveAttribute('src', FAKE_IMAGE_DATA_URL);
+
+    const magicResponse = page.waitForResponse((response) => response.url().includes('/api/magic-layer') && response.request().method() === 'POST');
+    await page.locator('button[title="Segment selected image into draggable Magic Layers"]').click();
+    const response = await magicResponse;
+    expect(response.ok()).toBeTruthy();
+
+    const overlay = page.locator('[data-testid="magic-layer-overlay"]');
+    await expect(overlay).toBeVisible();
+
+    const magicTool = page.locator('button[title="Magic Layer (7)"]');
+    await magicTool.click();
+
+    await expect(page.locator('[data-testid="magic-layer-apply"]')).toHaveCount(0);
+
+    const firstLayerId = await page.locator('[data-testid="magic-layer-item"]').first().getAttribute('data-magic-layer-id');
+    if (!firstLayerId) throw new Error('Magic layer id missing');
+    const layer = page.locator(`[data-testid="magic-layer-item"][data-magic-layer-id="${firstLayerId}"]`);
+    const before = await layer.boundingBox();
+    if (!before) throw new Error('Magic layer was not visible');
+    await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(before.x + before.width / 2 + 60, before.y + before.height / 2 + 30, { steps: 6 });
+    await page.mouse.up();
+
+    await expect.poll(async () => {
+      const after = await layer.boundingBox();
+      return after ? Math.round(after.x - before.x) : 0;
+    }).toBeGreaterThan(20);
+
+    const applyBtn = page.locator('[data-testid="magic-layer-apply"]');
+    await expect(applyBtn).toBeVisible();
+    await expect(applyBtn).toBeEnabled();
+
+    const applyBoxRect = await applyBtn.boundingBox();
+    const baseBoxRect = await page.getByAltText('Canvas base').first().boundingBox();
+    if (!applyBoxRect || !baseBoxRect) throw new Error('Apply or base image bbox missing');
+    expect(applyBoxRect.y + applyBoxRect.height).toBeLessThanOrEqual(baseBoxRect.y + baseBoxRect.height / 2);
+    expect(baseBoxRect.x + baseBoxRect.width - (applyBoxRect.x + applyBoxRect.width)).toBeLessThan(100);
+
+    const deleteBtnBox = await page.locator('button[aria-label="Delete image"]').first().boundingBox();
+    if (deleteBtnBox) {
+      expect(deleteBtnBox.x).toBeGreaterThanOrEqual(applyBoxRect.x + applyBoxRect.width - 1);
+    }
+
+    const editRequest = page.waitForRequest((req) => req.url().includes('/api/edit') && req.method() === 'POST');
+    await applyBtn.click();
+    await editRequest;
+
+    await expect.poll(() => editRequestCount).toBe(1);
+    expect(capturedEditPrompt).toBeTruthy();
+    expect(capturedEditPrompt).toContain('Inpaint the empty regions where objects used to be');
+    expect(capturedEditPrompt).toContain('magic layer apply test');
+    expect(capturedEditFormDataKeys).toContain('prompt');
+    expect(capturedEditFormDataKeys).toContain('parentId');
+    expect(capturedEditFormDataKeys).toContain('images');
+    expect(capturedEditFormDataKeys).toContain('maskImage');
+    expect(capturedEditFormDataKeys).toContain('size');
+
+    await expect(page.getByAltText('Canvas base')).toHaveCount(2, { timeout: 5000 });
+    await expect(page.getByText(/Magic Layer applied/i)).toBeVisible();
+  });
+
   test('draws pen stroke after zooming', async ({ page }) => {
     const promptInput = getPromptInput(page);
     await promptInput.fill('zoomed draw test');
@@ -1135,14 +1277,15 @@ test.describe('BananaTape Editor', () => {
     await promptInput.fill('initial red');
     await getGenerateButton(page).click();
 
-    const baseImage = page.getByAltText('Canvas base');
+    const baseImage = page.getByAltText('Canvas base').last();
     await expect(baseImage).toHaveAttribute('src', RED_IMAGE_DATA_URL);
 
     await promptInput.fill('first edit');
     await getEditButton(page).click();
     await expect(baseImage).toHaveAttribute('src', BLUE_IMAGE_DATA_URL);
     await page.waitForFunction(() => {
-      const img = document.querySelector('img[alt="Canvas base"]') as HTMLImageElement | null;
+      const images = Array.from(document.querySelectorAll('img[alt="Canvas base"]')) as HTMLImageElement[];
+      const img = images.at(-1);
       return img?.complete && img.naturalWidth === 4;
     });
 

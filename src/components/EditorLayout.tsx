@@ -52,19 +52,44 @@ function StandaloneEditorShell() {
         if (!historyRes.ok) return;
         const history = await historyRes.json();
         if (cancelled || !Array.isArray(history.entries)) return;
-        hydrateEntries(history.entries.map((entry: { assetUrl?: string; imageDataUrl?: string }) => ({
-          ...entry,
-          imageDataUrl: entry.imageDataUrl ?? entry.assetUrl,
-        })));
         const first = history.entries[0];
-        if (first?.assetUrl) setBaseImage(first.assetUrl, { width: 0, height: 0 });
+        const rootImageId = typeof first?.imageId === 'string' ? first.imageId : (typeof first?.id === 'string' ? first.id : null);
+        const entries = history.entries.map((entry: { id?: string; imageId?: string; assetUrl?: string; imageDataUrl?: string }) => ({
+          ...entry,
+          imageId: entry.imageId ?? rootImageId ?? undefined,
+          imageDataUrl: entry.imageDataUrl ?? entry.assetUrl,
+        }));
+        hydrateEntries(entries);
+        if (first?.assetUrl) {
+          setBaseImage(first.assetUrl, { width: 0, height: 0 });
+          if (rootImageId && canvasImageCount === 0) {
+            const rootImage: CanvasImage = {
+              id: rootImageId,
+              url: first.assetUrl,
+              assetId: typeof first.assetId === 'string' ? first.assetId : undefined,
+              size: { width: 1024, height: 1024 },
+              position: { x: 0, y: 0 },
+              parentId: null,
+              generationIndex: 0,
+              prompt: typeof first.prompt === 'string' ? first.prompt : '',
+              provider: first.provider === 'god-tibo' ? 'god-tibo' : 'openai',
+              type: first.type === 'edit' ? 'edit' : 'generate',
+              createdAt: typeof first.timestamp === 'number' ? first.timestamp : Date.now(),
+              paths: [],
+              boxes: [],
+              memos: [],
+              status: 'ready',
+            };
+            hydrateCanvas({ [rootImageId]: rootImage }, [rootImageId], [rootImageId]);
+          }
+        }
       } catch {
         // No active local project; keep no-project fallback behavior.
       }
     }
     void hydrateProjectHistory();
     return () => { cancelled = true; };
-  }, [hydrateEntries, setBaseImage]);
+  }, [canvasImageCount, hydrateCanvas, hydrateEntries, setBaseImage]);
 
   useEffect(() => {
     if (!baseImage || canvasImageCount > 0) return;

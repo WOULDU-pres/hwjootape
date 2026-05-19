@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { temporal } from 'zundo';
 import { devtools } from 'zustand/middleware';
-import type { CanvasImage, GenerationStatus } from '@/types/canvas';
+import type { CanvasImage, GenerationStatus, MagicLayer, MagicLayerStatus } from '@/types/canvas';
 import type { DrawingPath, BoundingBox, TextMemo } from '@/types';
 
 const MIN_ZOOM = 0.1;
@@ -46,6 +46,13 @@ export interface CanvasActions {
   removeMemoFromImage(imageId: string, memoId: string, options?: { track?: boolean; historySnapshot?: CanvasImage }): void;
 
   clearAnnotationsOnImage(imageId: string): void;
+
+  setMagicLayerStatus(imageId: string, status: MagicLayerStatus, error?: string): void;
+  setMagicLayers(imageId: string, layers: MagicLayer[], baseUrl: string): void;
+  selectMagicLayer(imageId: string, layerId: string | null): void;
+  updateMagicLayer(imageId: string, layerId: string, patch: Partial<Omit<MagicLayer, 'id'>>, options?: { track?: boolean }): void;
+  hideMagicLayer(imageId: string, layerId: string): void;
+  clearMagicLayers(imageId: string): void;
 
   undoImage(imageId: string): void;
   redoImage(imageId: string): void;
@@ -242,6 +249,31 @@ export const useCanvasStore = create<CanvasStore>()(
         memos: image.memos.filter((memo) => memo.id !== memoId),
       }), options),
       clearAnnotationsOnImage: (imageId) => mutateImage(set, imageId, (image) => ({ ...image, paths: [], boxes: [], memos: [] })),
+      setMagicLayerStatus: (imageId, status, error) => mutateImage(set, imageId, (image) => ({ ...image, magicLayerStatus: status, error }), { track: false }),
+      setMagicLayers: (imageId, layers, baseUrl) => mutateImage(set, imageId, (image) => ({
+        ...image,
+        magicLayers: layers,
+        magicLayerBaseUrl: baseUrl,
+        magicLayerStatus: 'ready',
+        selectedMagicLayerId: layers[0]?.id ?? null,
+      })),
+      selectMagicLayer: (imageId, layerId) => mutateImage(set, imageId, (image) => ({ ...image, selectedMagicLayerId: layerId }), { track: false }),
+      updateMagicLayer: (imageId, layerId, patch, options) => mutateImage(set, imageId, (image) => ({
+        ...image,
+        magicLayers: (image.magicLayers ?? []).map((layer) => (layer.id === layerId ? { ...layer, ...patch } : layer)),
+      }), options),
+      hideMagicLayer: (imageId, layerId) => mutateImage(set, imageId, (image) => ({
+        ...image,
+        magicLayers: (image.magicLayers ?? []).map((layer) => (layer.id === layerId ? { ...layer, hidden: true } : layer)),
+        selectedMagicLayerId: image.selectedMagicLayerId === layerId ? null : image.selectedMagicLayerId,
+      })),
+      clearMagicLayers: (imageId) => mutateImage(set, imageId, (image) => ({
+        ...image,
+        magicLayers: [],
+        magicLayerBaseUrl: undefined,
+        magicLayerStatus: 'idle',
+        selectedMagicLayerId: null,
+      })),
       undoImage: (imageId) => withTemporalPaused(() => set((state) => {
         const image = state.images[imageId];
         const history = state.imageHistories[imageId];

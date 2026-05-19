@@ -70,6 +70,8 @@
   "files": [
     "bin/",
     "src/",
+    "scripts/sam3-magic-layer.py",
+    "scripts/sam3-magic-layer-mlx.py",
     "public/",
     "next.config.ts",
     "postcss.config.mjs",

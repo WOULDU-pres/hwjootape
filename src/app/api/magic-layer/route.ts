@@ -90,7 +90,7 @@ export async function POST(request: Request) {
 
     const resolved = await resolveSam3Command();
 
-    if (resolved.source === 'auto-mlx' && resolved.argv) {
+    if ((resolved.source === 'auto-mlx' || resolved.source === 'auto-torch') && resolved.argv) {
       const segments = await runSam3Command(image, resolved.argv);
       return NextResponse.json({ success: true, source: 'sam3', segments: segments ?? fallbackSegments(width, height) });
     }

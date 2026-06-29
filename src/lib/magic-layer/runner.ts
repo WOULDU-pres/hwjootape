@@ -24,7 +24,7 @@ const MLX_SAM3_LEAN_DEPS = [
 const INSTALL_MANIFEST_VERSION = 1;
 const STALE_LOCK_MS = 60 * 60 * 1000;
 
-export type Sam3Source = 'env' | 'auto-mlx' | 'fallback';
+export type Sam3Source = 'env' | 'auto-mlx' | 'auto-torch' | 'fallback';
 
 export interface ResolvedSam3Command {
   source: Sam3Source;
@@ -57,11 +57,67 @@ export interface InstallStatus {
 export function isAutoInstallSupported(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env.BANANATAPE_DISABLE_AUTO_INSTALL === '1') return false;
   if (env.CI === 'true') return false;
-  return process.platform === 'darwin' && process.arch === 'arm64';
+  if (process.platform === 'darwin' && process.arch === 'arm64') return true; // MLX
+  if (process.platform === 'linux') return true; // PyTorch (CUDA/CPU)
+  return false;
 }
 
-export function getMlxInstallDir(env: NodeJS.ProcessEnv = process.env): string {
-  return path.join(getRuntimeDir(env), 'mlx_sam3');
+/**
+ * Per-platform SAM 3 backend. macOS Apple Silicon runs the MLX port; Linux runs
+ * Meta's official PyTorch SAM 3 (same `from sam3 import ...` API). Both install
+ * into their own runtime dir + venv so switching platforms never cross-pollutes.
+ */
+type Sam3Kind = 'mlx' | 'torch';
+
+interface Sam3Profile {
+  kind: Sam3Kind;
+  source: 'auto-mlx' | 'auto-torch';
+  pythonVersion: string;
+  installDirName: string;
+  repoUrl: string;
+  repoRef: string;
+  scriptPath: string;
+  /** Deps installed from the default (PyPI) index. */
+  preDeps: string[];
+  /** torch only: install torch/torchvision from the CUDA wheel index first. */
+  torchIndexDeps?: string[];
+  torchIndexUrl?: string;
+  /** mlx installs the source with --no-deps (lean); torch pulls sam3's deps. */
+  editableNoDeps: boolean;
+}
+
+export function getSam3Profile(env: NodeJS.ProcessEnv = process.env): Sam3Profile {
+  if (process.platform === 'linux') {
+    return {
+      kind: 'torch',
+      source: 'auto-torch',
+      pythonVersion: env.BANANATAPE_SAM3_PYTHON_VERSION || '3.12',
+      installDirName: 'torch_sam3',
+      repoUrl: env.BANANATAPE_SAM3_REPO_URL || 'https://github.com/facebookresearch/sam3.git',
+      repoRef: env.BANANATAPE_SAM3_REPO_REF || 'main',
+      scriptPath: path.resolve(process.cwd(), 'scripts', 'sam3-magic-layer-torch.py'),
+      preDeps: ['numpy', 'pillow'],
+      torchIndexDeps: ['torch', 'torchvision'],
+      torchIndexUrl: env.BANANATAPE_TORCH_INDEX_URL || 'https://download.pytorch.org/whl/cu126',
+      editableNoDeps: false,
+    };
+  }
+  // darwin/arm64 (default): MLX port.
+  return {
+    kind: 'mlx',
+    source: 'auto-mlx',
+    pythonVersion: MLX_SAM3_PYTHON_VERSION,
+    installDirName: 'mlx_sam3',
+    repoUrl: MLX_SAM3_REPO_URL,
+    repoRef: MLX_SAM3_REPO_REF,
+    scriptPath: path.resolve(process.cwd(), 'scripts', 'sam3-magic-layer-mlx.py'),
+    preDeps: MLX_SAM3_LEAN_DEPS,
+    editableNoDeps: true,
+  };
+}
+
+export function getSam3InstallDir(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(getRuntimeDir(env), getSam3Profile(env).installDirName);
 }
 
 function getVenvPythonPath(installDir: string): string {
@@ -84,8 +140,8 @@ function getInstallLogPath(installDir: string): string {
   return path.join(installDir, 'install.log');
 }
 
-export function getBundledMlxScriptPath(): string {
-  return path.resolve(process.cwd(), 'scripts', 'sam3-magic-layer-mlx.py');
+export function getBundledScriptPath(env: NodeJS.ProcessEnv = process.env): string {
+  return getSam3Profile(env).scriptPath;
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -204,59 +260,75 @@ export interface InstallAttemptResult {
   errorCode?: string;
 }
 
-async function performInstall(installDir: string, uvPath: string, scriptPath: string): Promise<void> {
+async function performInstall(installDir: string, uvPath: string, profile: Sam3Profile): Promise<void> {
   const venvPython = getVenvPythonPath(installDir);
-  const srcDir = path.join(installDir, 'mlx_sam3-src');
+  const srcDir = path.join(installDir, 'sam3-src');
 
   await writeStatus(installDir, {
     installed: false,
     installing: true,
     failed: false,
-    message: 'Creating Python 3.13 environment with uv...',
+    message: `Creating Python ${profile.pythonVersion} environment with uv...`,
     startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     canFallback: true,
   });
-  await appendLog(installDir, 'starting install');
+  await appendLog(installDir, `starting ${profile.kind} install`);
 
-  await execFileAsync(uvPath, ['venv', '--python', MLX_SAM3_PYTHON_VERSION, path.join(installDir, '.venv')], { timeout: 5 * 60 * 1000 });
+  await execFileAsync(uvPath, ['venv', '--python', profile.pythonVersion, path.join(installDir, '.venv')], { timeout: 5 * 60 * 1000 });
+
+  // torch profile: install the CUDA-tagged torch/torchvision from the PyTorch
+  // wheel index first, so the editable sam3 install below finds them satisfied
+  // and doesn't pull a CPU build from PyPI.
+  if (profile.torchIndexDeps && profile.torchIndexDeps.length > 0) {
+    await writeStatus(installDir, {
+      installed: false,
+      installing: true,
+      failed: false,
+      message: `Installing CUDA PyTorch from ${profile.torchIndexUrl} ...`,
+      updatedAt: new Date().toISOString(),
+      canFallback: true,
+    });
+    await execFileAsync(uvPath, ['pip', 'install', '--python', venvPython, '--index-url', profile.torchIndexUrl!, ...profile.torchIndexDeps], { timeout: 20 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
+  }
 
   await writeStatus(installDir, {
     installed: false,
     installing: true,
     failed: false,
-    message: 'Installing lean Python dependencies (torch, mlx, ...)',
+    message: profile.kind === 'mlx' ? 'Installing lean Python dependencies (torch, mlx, ...)' : 'Installing Python dependencies...',
     updatedAt: new Date().toISOString(),
     canFallback: true,
   });
 
-  await execFileAsync(uvPath, ['pip', 'install', '--python', venvPython, ...MLX_SAM3_LEAN_DEPS], { timeout: 15 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
+  await execFileAsync(uvPath, ['pip', 'install', '--python', venvPython, ...profile.preDeps], { timeout: 15 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
 
   await writeStatus(installDir, {
     installed: false,
     installing: true,
     failed: false,
-    message: 'Cloning mlx_sam3 source (preserves bundled BPE tokenizer assets)...',
+    message: `Cloning ${profile.repoUrl} ...`,
     updatedAt: new Date().toISOString(),
     canFallback: true,
   });
 
   await rm(srcDir, { recursive: true, force: true });
-  await execFileAsync('git', ['clone', '--depth', '1', '--branch', MLX_SAM3_REPO_REF, MLX_SAM3_REPO_URL, srcDir], { timeout: 5 * 60 * 1000 });
+  await execFileAsync('git', ['clone', '--depth', '1', '--branch', profile.repoRef, profile.repoUrl, srcDir], { timeout: 5 * 60 * 1000 });
 
-  await execFileAsync(uvPath, ['pip', 'install', '--python', venvPython, '--no-deps', '-e', srcDir], { timeout: 5 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
+  const editableArgs = ['pip', 'install', '--python', venvPython, ...(profile.editableNoDeps ? ['--no-deps'] : []), '-e', srcDir];
+  await execFileAsync(uvPath, editableArgs, { timeout: 10 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
 
   await execFileAsync(venvPython, ['-c', 'from sam3 import build_sam3_image_model; from sam3.model.sam3_image_processor import Sam3Processor'], { timeout: 60_000 });
 
   const manifest: InstallManifest = {
     installVersion: INSTALL_MANIFEST_VERSION,
     installedAt: new Date().toISOString(),
-    pythonVersion: MLX_SAM3_PYTHON_VERSION,
-    repoUrl: MLX_SAM3_REPO_URL,
-    repoRef: MLX_SAM3_REPO_REF,
-    deps: MLX_SAM3_LEAN_DEPS,
+    pythonVersion: profile.pythonVersion,
+    repoUrl: profile.repoUrl,
+    repoRef: profile.repoRef,
+    deps: [...(profile.torchIndexDeps ?? []), ...profile.preDeps],
     pythonPath: venvPython,
-    scriptPath,
+    scriptPath: profile.scriptPath,
   };
   const tmp = `${getManifestPath(installDir)}.tmp`;
   await writeFile(tmp, JSON.stringify(manifest, null, 2), 'utf8');
@@ -266,7 +338,7 @@ async function performInstall(installDir: string, uvPath: string, scriptPath: st
     installed: true,
     installing: false,
     failed: false,
-    message: 'mlx_sam3 ready. First Magic Layer run downloads ~3.4GB of model weights.',
+    message: `SAM 3 (${profile.kind}) ready. First Magic Layer run downloads ~3.4GB of model weights.`,
     updatedAt: new Date().toISOString(),
     canFallback: true,
   });
@@ -277,19 +349,20 @@ let inFlight: Promise<void> | null = null;
 
 export async function startInstallInBackground(env: NodeJS.ProcessEnv = process.env): Promise<InstallAttemptResult> {
   if (!isAutoInstallSupported(env)) {
-    return { status: 'unsupported', message: 'Auto-install only runs on macOS Apple Silicon.' };
+    return { status: 'unsupported', message: 'Auto-install runs on macOS Apple Silicon or Linux.' };
   }
 
-  const installDir = getMlxInstallDir(env);
-  const scriptPath = getBundledMlxScriptPath();
+  const profile = getSam3Profile(env);
+  const installDir = getSam3InstallDir(env);
+  const scriptPath = profile.scriptPath;
 
   if (!(await pathExists(scriptPath))) {
-    return { status: 'failed', message: `Bundled mlx wrapper script not found: ${scriptPath}`, errorCode: 'SCRIPT_MISSING' };
+    return { status: 'failed', message: `Bundled SAM 3 wrapper script not found: ${scriptPath}`, errorCode: 'SCRIPT_MISSING' };
   }
 
   const manifest = await readManifest(installDir);
   if (manifest && (await verifyInstalledManifest(manifest))) {
-    return { status: 'already-installed', message: 'mlx_sam3 already installed.' };
+    return { status: 'already-installed', message: `SAM 3 (${profile.kind}) already installed.` };
   }
 
   if (inFlight) return { status: 'already-installing', message: 'Install already in progress.' };
@@ -304,11 +377,11 @@ export async function startInstallInBackground(env: NodeJS.ProcessEnv = process.
   }
 
   const acquired = await acquireLock(installDir);
-  if (!acquired) return { status: 'already-installing', message: 'Another process is installing mlx_sam3.' };
+  if (!acquired) return { status: 'already-installing', message: 'Another process is installing SAM 3.' };
 
   inFlight = (async () => {
     try {
-      await performInstall(installDir, uvPath, scriptPath);
+      await performInstall(installDir, uvPath, profile);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Install failed';
       await writeStatus(installDir, {
@@ -329,18 +402,18 @@ export async function startInstallInBackground(env: NodeJS.ProcessEnv = process.
 
   void inFlight;
 
-  return { status: 'started', message: 'mlx_sam3 install started in background.' };
+  return { status: 'started', message: `SAM 3 (${profile.kind}) install started in background.` };
 }
 
 export async function readInstallStatus(env: NodeJS.ProcessEnv = process.env): Promise<InstallStatus> {
-  const installDir = getMlxInstallDir(env);
+  const installDir = getSam3InstallDir(env);
   const manifest = await readManifest(installDir);
   if (manifest && (await verifyInstalledManifest(manifest))) {
     return {
       installed: true,
       installing: false,
       failed: false,
-      message: 'mlx_sam3 ready.',
+      message: `SAM 3 (${getSam3Profile(env).kind}) ready.`,
       updatedAt: manifest.installedAt,
       canFallback: true,
     };
@@ -372,14 +445,15 @@ export async function resolveSam3Command(env: NodeJS.ProcessEnv = process.env): 
     };
   }
 
-  const installDir = getMlxInstallDir(env);
+  const profile = getSam3Profile(env);
+  const installDir = getSam3InstallDir(env);
   const manifest = await readManifest(installDir);
   if (manifest && (await verifyInstalledManifest(manifest))) {
     return {
-      source: 'auto-mlx',
+      source: profile.source,
       argv: [manifest.pythonPath, manifest.scriptPath],
     };
   }
 
-  return { source: 'fallback', argv: null, reason: 'auto-mlx not yet installed' };
+  return { source: 'fallback', argv: null, reason: `${profile.kind} sam3 not yet installed` };
 }

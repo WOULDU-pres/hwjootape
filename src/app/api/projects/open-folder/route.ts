@@ -7,24 +7,50 @@ import { resolveRequestProjectRoot } from '@/lib/projects/session';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+function isWsl(): boolean {
+  // WSL sets these in the Linux env; either is a reliable signal.
+  return process.platform === 'linux' && (!!process.env.WSL_DISTRO_NAME || !!process.env.WSL_INTEROP);
+}
+
+// Try each [cmd, args] in turn, detached + unref, advancing to the next only if
+// the spawn errors (e.g. ENOENT when wslview isn't installed). The async 'error'
+// handler is required so a missing binary never crashes the server process.
+function spawnWithFallback(candidates: Array<[string, string[]]>): void {
+  if (candidates.length === 0) return;
+  const [[cmd, args], ...rest] = candidates;
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    child.on('error', () => spawnWithFallback(rest));
+    child.unref();
+  } catch {
+    spawnWithFallback(rest);
+  }
+}
+
 /**
  * Open a file manager window in the OS, scoped to the active project.
  *
  * Mirrors the spawnBrowser() platform dispatch in bin/bananatape.mjs:
- * open (darwin) / explorer-via-cmd (win32) / xdg-open (linux), always spawned
- * with an argument array (never a shell string), detached + unref.
+ * open (darwin) / explorer-via-cmd (win32) / wslview-or-xdg-open (linux/WSL),
+ * always spawned with an argument array (never a shell string), detached + unref.
  */
 function openInFileManager(dir: string): void {
   if (process.platform === 'darwin') {
-    spawn('open', [dir], { stdio: 'ignore', detached: true }).unref();
+    spawnWithFallback([['open', [dir]]]);
     return;
   }
   if (process.platform === 'win32') {
     // start needs an empty "" title arg; cmd /c keeps it off a shell string.
-    spawn('cmd', ['/c', 'start', '', dir], { stdio: 'ignore', detached: true }).unref();
+    spawnWithFallback([['cmd', ['/c', 'start', '', dir]]]);
     return;
   }
-  spawn('xdg-open', [dir], { stdio: 'ignore', detached: true }).unref();
+  // On WSL prefer wslview (wslu), which converts the Linux path and opens it in
+  // Windows Explorer; fall back to xdg-open for a real Linux desktop.
+  if (isWsl()) {
+    spawnWithFallback([['wslview', [dir]], ['xdg-open', [dir]]]);
+    return;
+  }
+  spawnWithFallback([['xdg-open', [dir]]]);
 }
 
 /**

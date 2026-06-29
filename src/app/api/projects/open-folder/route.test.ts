@@ -7,7 +7,9 @@ const mocks = vi.hoisted(() => ({
   spawn: vi.fn((command: string, args: readonly string[]) => {
     void command;
     void args;
-    return { unref: vi.fn() };
+    // Mirror the ChildProcess surface spawnWithFallback() touches: .on('error')
+    // (to advance to the next candidate) and .unref().
+    return { on: vi.fn(), unref: vi.fn() };
   }),
   resolveRequestProjectRoot: vi.fn<(request: Request) => Promise<string | null>>(),
 }));

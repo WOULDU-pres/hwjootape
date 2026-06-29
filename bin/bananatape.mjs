@@ -179,10 +179,32 @@ async function prepareStandaloneServer() {
   await syncDirectoryIfPresent(path.join(APP_ROOT, '.next', 'static'), path.join(standaloneRoot, '.next', 'static'));
   await syncDirectoryIfPresent(path.join(APP_ROOT, 'public'), path.join(standaloneRoot, 'public'));
 }
+function isWsl() {
+  // WSL sets these in the Linux env; either is a reliable signal.
+  return process.platform === 'linux' && (!!process.env.WSL_DISTRO_NAME || !!process.env.WSL_INTEROP);
+}
+// Try each [cmd, args] in turn, detached + unref, advancing to the next only if
+// the spawn errors (e.g. ENOENT when wslview isn't installed). The async 'error'
+// handler is required so a missing binary never crashes the parent.
+function spawnWithFallback(candidates) {
+  if (candidates.length === 0) return null;
+  const [[cmd, args], ...rest] = candidates;
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    child.on('error', () => spawnWithFallback(rest));
+    child.unref();
+    return child;
+  } catch {
+    return spawnWithFallback(rest);
+  }
+}
 function spawnBrowser(url) {
-  if (process.platform === 'darwin') return spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
-  if (process.platform === 'win32') return spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true }).unref();
-  return spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+  if (process.platform === 'darwin') return spawnWithFallback([['open', [url]]]);
+  if (process.platform === 'win32') return spawnWithFallback([['cmd', ['/c', 'start', '', url]]]);
+  // On WSL there's usually no X display for xdg-open: prefer wslview (wslu),
+  // then explorer.exe (opens the Windows default browser), then xdg-open.
+  if (isWsl()) return spawnWithFallback([['wslview', [url]], ['explorer.exe', [url]], ['xdg-open', [url]]]);
+  return spawnWithFallback([['xdg-open', [url]]]);
 }
 async function launchProject(ref, options) {
   const project = await resolveProject(ref);

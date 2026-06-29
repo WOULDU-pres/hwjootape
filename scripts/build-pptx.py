@@ -49,9 +49,16 @@ ALIGN = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIG
 # bullet BODY instead of dropping to the box's left edge.
 BULLET_PREFIX = "• "
 
+# Pillow-only font candidates used for fit measurement (the .pptx itself stores
+# font *names*, not files). Prefer the bundled Pretendard so measurement matches
+# render-png.py across macOS / Linux / Windows.
+_BUNDLED_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _KOREAN_TTF = [
+    (os.path.join(_BUNDLED_FONT_DIR, "Pretendard-Regular.otf"), 0),
     ("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0),
     ("/System/Library/Fonts/Supplemental/AppleGothic.ttf", 0),
+    ("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", 0),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
 ]
 
 

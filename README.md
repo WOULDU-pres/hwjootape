@@ -97,7 +97,37 @@ hwjootape deck "내 덱" outline.md --style "미니멀, 파란 액센트, 기업
 
 `deck`은 프로젝트가 안 켜져 있으면 **자동으로 실행**한 뒤 진행합니다. 결과 `.pptx`/`.png` 경로를 출력합니다.
 
-> 참고: 이미지 생성은 `OPENAI_API_KEY`(OpenAI) 또는 Codex 로그인(`~/.codex/auth.json`, god-tibo)을 사용합니다. 아래 Provider setup 참고. 첫 분해 때 macOS Apple Silicon은 SAM3 모델(~4GB)을 한 번 받습니다.
+> 참고: 이미지 생성은 `OPENAI_API_KEY`(OpenAI) 또는 Codex 로그인(`~/.codex/auth.json`, god-tibo)을 사용합니다. 아래 Provider setup 참고. 첫 분해 때 SAM3 모델(~3.4GB)을 한 번 받습니다(macOS Apple Silicon = MLX, Linux/WSL = PyTorch CUDA).
+
+## WSL / Linux setup (덱 생성기)
+
+덱 생성기의 **분해** 단계는 OCR(텍스트 영역 검출)과 SAM3(객체 분할)에 의존합니다. macOS에서는 Apple Vision OCR + MLX SAM3를 자동으로 쓰고, **Linux/WSL에서는 PaddleOCR + PyTorch SAM3가 첫 실행 시 자동 설치**됩니다. 단일 코드베이스가 플랫폼을 감지해 백엔드를 고릅니다.
+
+**전제 조건 (한 번만):**
+
+```bash
+# 1) uv (파이썬 환경 자동 프로비저닝에 필요)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 2) WSL2 + NVIDIA GPU 드라이버 (CUDA 패스스루). 확인:
+nvidia-smi
+# 3) SAM3 가중치는 게이트됨 — 라이선스 동의 후 1회 로그인
+hf auth login
+```
+
+첫 분해 시 자동 설치되는 것:
+
+- **PaddleOCR** — `~/.bananatape/paddleocr/.venv`에 `paddlepaddle-gpu`(기본 cu126 인덱스) + `paddleocr`(`lang=korean`). 첫 실행 때 한국어 모델을 받습니다.
+- **PyTorch SAM3** — 위 *Magic Layer segmentation* 참고.
+
+CUDA 버전이 다르면 env로 조정합니다(기본은 torch·paddle 공통인 **cu126**):
+
+```bash
+export BANANATAPE_TORCH_INDEX_URL="https://download.pytorch.org/whl/cu130"          # SAM3 torch
+export BANANATAPE_PADDLE_INDEX_URL="https://www.paddlepaddle.org.cn/packages/stable/cu130/"  # PaddleOCR
+export BANANATAPE_PADDLE_PACKAGE="paddlepaddle"   # GPU 없이 CPU만 쓸 때
+```
+
+한글 폰트는 [Pretendard](https://github.com/orioncactus/pretendard)(OFL)를 `scripts/fonts/`에 번들로 포함해 macOS·Linux·Windows에서 동일하게 렌더링됩니다. 별도 설치가 필요 없습니다(시스템 Nanum/Noto CJK가 있으면 폴백으로도 사용).
 
 ## Provider setup
 
@@ -160,13 +190,21 @@ export BANANATAPE_DISABLE_AUTO_INSTALL=1
 
 `CI=true` also disables auto-install automatically.
 
-**Linux / NVIDIA CUDA — official SAM 3**
+**Linux / WSL + NVIDIA CUDA — zero-config auto-install (official PyTorch SAM 3)**
 
-On non-Apple platforms, set `BANANATAPE_SAM3_COMMAND` to point at the official `scripts/sam3-magic-layer.py` wrapper after installing [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) in a separate environment:
+On the first Magic Layer click, BananaTape:
+
+1. Detects `linux`.
+2. Creates a managed Python virtualenv under `~/.bananatape/torch_sam3/.venv`.
+3. Installs CUDA PyTorch (`torch`, `torchvision`) from the PyTorch wheel index (defaults to **cu126**).
+4. Installs [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) (same `build_sam3_image_model` / `Sam3Processor` API as the MLX port) from source.
+5. Caches everything; subsequent runs skip the install path.
+
+The SAM 3 weights (`facebook/sam3`, ~3.4 GB) are **gated** on Hugging Face — accept the license and `hf auth login` once so the first run can download them. Tune the toolchain via env if your CUDA differs:
 
 ```bash
-export BANANATAPE_SAM3_COMMAND="python3 /path/to/bananatape/scripts/sam3-magic-layer.py --prompts text,logo,person,product,object --input {input} --output {output}"
-bananatape launch logo-explorations
+export BANANATAPE_TORCH_INDEX_URL="https://download.pytorch.org/whl/cu130"  # CUDA 13.0
+export BANANATAPE_SAM3_PYTHON_VERSION="3.12"                                # venv python
 ```
 
 **Custom backend**

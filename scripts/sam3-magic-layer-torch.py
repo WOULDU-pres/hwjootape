@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""PyTorch SAM 3 adapter for BananaTape Magic Layer (Linux/WSL + CUDA).
+
+Linux/CUDA counterpart of sam3-magic-layer-mlx.py. Bridges Meta's official
+PyTorch SAM 3 (github.com/facebookresearch/sam3), which exposes the SAME
+build_sam3_image_model / Sam3Processor API as the MLX port, to BananaTape's
+/api/magic-layer JSON contract:
+
+  {"segments": [{"id", "label", "score", "bbox":{"x","y","width","height"},
+                 "maskDataUrl": "data:image/png;base64,..."}]}
+
+BananaTape's auto-installer calls this script with:
+  --input <png path>  --output <json path>  [--prompts a,b,c]
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import torch
+from PIL import Image
+
+from sam3 import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run mlx_sam3 and emit BananaTape Magic Layer segments JSON.")
+    parser.add_argument("positional_input", nargs="?", help="Input image path (fallback positional form).")
+    parser.add_argument("positional_output", nargs="?", help="Output JSON path (fallback positional form).")
+    parser.add_argument("--input", dest="input_path", help="Input image path.")
+    parser.add_argument("--output", dest="output_path", help="Output JSON path.")
+    parser.add_argument(
+        "--prompts",
+        default="person,animal,cat,dog,bird,plant,flower,tree,food,product,bottle,cup,chair,table,car,building,text,logo",
+        help="Comma-separated SAM 3 concept prompts to try. Specific nouns work much better than generic 'object'.",
+    )
+    parser.add_argument("--score-threshold", type=float, default=0.25, help="Minimum SAM 3 score to keep after model inference.")
+    parser.add_argument("--max-segments", type=int, default=40, help="Maximum number of segments to emit.")
+    parser.add_argument("--confidence-threshold", type=float, default=0.2, help="Sam3Processor confidence threshold before post-filtering.")
+    parser.add_argument("--min-area-ratio", type=float, default=0.002, help="Drop masks smaller than this fraction of the image.")
+    parser.add_argument("--max-area-ratio", type=float, default=0.75, help="Drop masks larger than this fraction of the image.")
+    parser.add_argument("--nms-iou", type=float, default=0.72, help="Drop lower-scoring boxes with IoU above this value.")
+    parser.add_argument("--layout-segments", type=int, default=12, help="Maximum coarse no-dependency layout/color components to add for slide-like images.")
+    parser.add_argument("--layout-detail-segments", type=int, default=24, help="Maximum fine no-dependency layout/color components to add for slide-like images.")
+    parser.add_argument("--layout-color-segments", type=int, default=24, help="Maximum color-separated layout components to add for slide-like images.")
+    parser.add_argument("--layout-distance-threshold", type=float, default=42.0, help="RGB distance from border-estimated background for layout component extraction.")
+    parser.add_argument("--device", default=None, help='Torch device, e.g. "cuda", "cuda:0", "cpu". Default: cuda if available.')
+    parser.add_argument("--debug", action="store_true", help="Print debug info to stderr.")
+    return parser.parse_args()
+
+
+def to_numpy(arr) -> np.ndarray:
+    if hasattr(arr, "detach"):  # torch.Tensor
+        return arr.detach().cpu().numpy()
+    return np.asarray(arr)
+
+
+def mask_to_data_url(mask_array, target_w: int, target_h: int) -> str:
+    arr = to_numpy(mask_array)
+    while arr.ndim > 2:
+        arr = arr.squeeze(axis=0) if arr.shape[0] == 1 else arr[0]
+    alpha = (arr > 0).astype("uint8") * 255
+    image = Image.fromarray(alpha, mode="L")
+    if image.size != (target_w, target_h):
+        image = image.resize((target_w, target_h), resample=Image.NEAREST)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def box_to_xywh(box) -> dict[str, float]:
+    arr = to_numpy(box).astype(float).flatten()
+    if arr.size != 4:
+        raise ValueError(f"Expected 4 box values, got {arr.size}")
+    x1, y1, x2, y2 = arr.tolist()
+    return {"x": x1, "y": y1, "width": max(1.0, x2 - x1), "height": max(1.0, y2 - y1)}
+
+
+def score_at(scores, index: int) -> float:
+    if scores is None:
+        return 1.0
+    arr = to_numpy(scores)
+    if arr.size == 0:
+        return 1.0
+    return float(arr.flat[index])
+
+
+def binary_mask(mask_array) -> np.ndarray:
+    arr = to_numpy(mask_array)
+    while arr.ndim > 2:
+        arr = arr.squeeze(axis=0) if arr.shape[0] == 1 else arr[0]
+    return arr > 0
+
+
+def mask_bbox(mask_array, fallback_box) -> dict[str, float]:
+    mask = binary_mask(mask_array)
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0 or ys.size == 0:
+        return box_to_xywh(fallback_box)
+    x1 = float(xs.min())
+    y1 = float(ys.min())
+    x2 = float(xs.max() + 1)
+    y2 = float(ys.max() + 1)
+    return {"x": x1, "y": y1, "width": max(1.0, x2 - x1), "height": max(1.0, y2 - y1)}
+
+
+def area_ratio(box: dict[str, float], image_size: tuple[int, int]) -> float:
+    target_w, target_h = image_size
+    return (box["width"] * box["height"]) / max(1.0, float(target_w * target_h))
+
+
+def iou(a: dict[str, float], b: dict[str, float]) -> float:
+    ax2 = a["x"] + a["width"]
+    ay2 = a["y"] + a["height"]
+    bx2 = b["x"] + b["width"]
+    by2 = b["y"] + b["height"]
+    ix1 = max(a["x"], b["x"])
+    iy1 = max(a["y"], b["y"])
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    union = a["width"] * a["height"] + b["width"] * b["height"] - inter
+    return inter / max(union, 1e-6)
+
+
+def intersection_area(a: dict[str, float], b: dict[str, float]) -> float:
+    ax2 = a["x"] + a["width"]
+    ay2 = a["y"] + a["height"]
+    bx2 = b["x"] + b["width"]
+    by2 = b["y"] + b["height"]
+    ix1 = max(a["x"], b["x"])
+    iy1 = max(a["y"], b["y"])
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    return max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+
+def box_area(box: dict[str, float]) -> float:
+    return max(0.0, box["width"]) * max(0.0, box["height"])
+
+
+def containment_ratio(child: dict[str, float], parent: dict[str, float]) -> float:
+    return intersection_area(child, parent) / max(box_area(child), 1e-6)
+
+
+def suppress_nested_sam_parts(segments: list[dict]) -> list[dict]:
+    kept: list[dict] = []
+    for child in segments:
+        if child.get("source") == "layout":
+            kept.append(child)
+            continue
+        child_box = child["bbox"]
+        child_area = box_area(child_box)
+        suppress = False
+        for parent in segments:
+            if parent is child or parent.get("source") == "layout":
+                continue
+            parent_box = parent["bbox"]
+            parent_area = box_area(parent_box)
+            if parent_area < child_area * 1.35:
+                continue
+            if containment_ratio(child_box, parent_box) < 0.82:
+                continue
+            if float(parent.get("score", 0)) < float(child.get("score", 0)) * 0.35:
+                continue
+            suppress = True
+            break
+        if not suppress:
+            kept.append(child)
+    return kept
+
+
+def dedupe_segments(segments: list[dict], nms_iou: float, max_segments: int) -> list[dict]:
+    candidates = suppress_nested_sam_parts(segments)
+    ordered = sorted(
+        candidates,
+        key=lambda s: (float(s.get("score", 0)), min(box_area(s["bbox"]), 1_000_000.0)),
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for segment in ordered:
+        if any(iou(segment["bbox"], existing["bbox"]) >= nms_iou for existing in kept):
+            continue
+        kept.append(segment)
+        if len(kept) >= max_segments:
+            break
+    return kept
+
+
+def connected_components(mask: "object") -> list[tuple[int, int, int, int, int]]:
+    import numpy as np
+
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    components: list[tuple[int, int, int, int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for start_x, start_y in zip(xs.tolist(), ys.tolist()):
+        if visited[start_y, start_x]:
+            continue
+        stack = [(start_x, start_y)]
+        visited[start_y, start_x] = True
+        min_x = max_x = start_x
+        min_y = max_y = start_y
+        area = 0
+        while stack:
+            x, y = stack.pop()
+            area += 1
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if nx < 0 or ny < 0 or nx >= w or ny >= h or visited[ny, nx] or not mask[ny, nx]:
+                    continue
+                visited[ny, nx] = True
+                stack.append((nx, ny))
+        components.append((min_x, min_y, max_x + 1, max_y + 1, area))
+    return components
+
+
+def layout_component_segments(
+    foreground,
+    image_size: tuple[int, int],
+    scale: float,
+    kernel: int,
+    max_segments: int,
+    min_area_ratio: float,
+    max_area_ratio: float,
+    score: float,
+    id_prefix: str,
+    label: str,
+    include_filled_box: bool = False,
+) -> list[tuple[float, dict]]:
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    if max_segments <= 0:
+        return []
+
+    target_w, target_h = image_size
+    small_w = max(1, int(round(target_w * scale)))
+    small_h = max(1, int(round(target_h * scale)))
+    small = Image.fromarray((foreground.astype("uint8") * 255), mode="L").resize((small_w, small_h), resample=Image.Resampling.NEAREST)
+    if kernel > 1:
+        if kernel % 2 == 0:
+            kernel += 1
+        small = small.filter(ImageFilter.MaxFilter(kernel))
+    small_mask = np.asarray(small) > 0
+
+    components = []
+    layout_max_area_ratio = min(max_area_ratio, 0.45)
+    layout_min_area_ratio = min_area_ratio if id_prefix == "layout" else min(min_area_ratio, 0.00045)
+    for sx1, sy1, sx2, sy2, small_area in connected_components(small_mask):
+        x1 = max(0, int(sx1 / scale) - 3)
+        y1 = max(0, int(sy1 / scale) - 3)
+        x2 = min(target_w, int(np.ceil(sx2 / scale)) + 3)
+        y2 = min(target_h, int(np.ceil(sy2 / scale)) + 3)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        component_mask = np.zeros((target_h, target_w), dtype=bool)
+        if include_filled_box:
+            component_mask[y1:y2, x1:x2] = True
+        else:
+            component_mask[y1:y2, x1:x2] = foreground[y1:y2, x1:x2]
+        bbox = mask_bbox(component_mask, [x1, y1, x2, y2])
+        ratio = area_ratio(bbox, image_size)
+        if ratio < layout_min_area_ratio or ratio > layout_max_area_ratio:
+            continue
+        # Prefer practical movable elements over tiny glyph dust: very thin components
+        # are usually individual strokes unless they are wide enough to be a text line.
+        if id_prefix == "layout-detail" and (bbox["width"] < 8 or bbox["height"] < 8):
+            continue
+        priority = bbox["width"] * bbox["height"] + small_area / max(scale * scale, 1e-6)
+        components.append((priority, bbox, component_mask))
+
+    components.sort(key=lambda item: item[0], reverse=True)
+    segments = []
+    for emitted, (_priority, bbox, component_mask) in enumerate(components[:max_segments], start=1):
+        segments.append((
+            box_area(bbox),
+            {
+                "id": f"{id_prefix}-{emitted}",
+                "label": label,
+                "score": score,
+                "source": "layout",
+                "bbox": bbox,
+                "maskDataUrl": mask_to_data_url(component_mask, target_w, target_h),
+            },
+        ))
+    return segments
+
+
+def color_component_segments(
+    arr,
+    foreground,
+    image_size: tuple[int, int],
+    scale: float,
+    max_segments: int,
+    min_area_ratio: float,
+    max_area_ratio: float,
+) -> list[tuple[float, dict]]:
+    import numpy as np
+
+    if max_segments <= 0:
+        return []
+
+    quantized = (arr // 32).astype("int16")
+    flat_keys = quantized[..., 0] * 100 + quantized[..., 1] * 10 + quantized[..., 2]
+    keys, counts = np.unique(flat_keys[foreground], return_counts=True)
+    order = keys[np.argsort(counts)[::-1]]
+    segments: list[tuple[float, dict]] = []
+    for key in order.tolist():
+        if len(segments) >= max_segments * 3:
+            break
+        color_mask = foreground & (flat_keys == key)
+        if float(color_mask.mean()) < 0.0002:
+            continue
+        segments.extend(layout_component_segments(
+            color_mask,
+            image_size,
+            scale,
+            max(3, int(round(5 * scale))),
+            max_segments,
+            min_area_ratio,
+            max_area_ratio,
+            0.43,
+            "layout-color",
+            "layout color element",
+            include_filled_box=False,
+        ))
+    segments.sort(key=lambda item: item[0], reverse=True)
+    deduped: list[tuple[float, dict]] = []
+    seen: set[str] = set()
+    for _area, segment in segments:
+        bbox = segment["bbox"]
+        key = f"{round(bbox['x'])}:{round(bbox['y'])}:{round(bbox['width'])}:{round(bbox['height'])}"
+        if key in seen:
+            continue
+        seen.add(key)
+        segment["id"] = f"layout-color-{len(deduped) + 1}"
+        deduped.append((box_area(bbox), segment))
+        if len(deduped) >= max_segments:
+            break
+    return deduped
+
+
+def iter_layout_segments(
+    image,
+    image_size: tuple[int, int],
+    max_segments: int,
+    detail_segments: int,
+    color_segments: int,
+    threshold: float,
+    min_area_ratio: float,
+    max_area_ratio: float,
+) -> Iterable[dict]:
+    import numpy as np
+
+    target_w, target_h = image_size
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    border = np.concatenate([arr[0, :, :], arr[-1, :, :], arr[:, 0, :], arr[:, -1, :]], axis=0)
+    background = np.median(border, axis=0)
+    distance = np.sqrt(((arr - background) ** 2).sum(axis=2))
+    foreground = distance > threshold
+    foreground_ratio = float(foreground.mean())
+    if foreground_ratio < 0.005 or foreground_ratio > 0.78:
+        return
+
+    scale = min(1.0, 420.0 / max(target_w, target_h))
+    coarse_kernel = max(3, int(round(19 * scale)))
+    detail_kernel = max(3, int(round(7 * scale)))
+
+    coarse = layout_component_segments(
+        foreground,
+        image_size,
+        scale,
+        coarse_kernel,
+        max_segments,
+        min_area_ratio,
+        max_area_ratio,
+        0.45,
+        "layout",
+        "layout group",
+        include_filled_box=True,
+    )
+    details = layout_component_segments(
+        foreground,
+        image_size,
+        scale,
+        detail_kernel,
+        detail_segments,
+        min_area_ratio,
+        max_area_ratio,
+        0.44,
+        "layout-detail",
+        "layout detail",
+        include_filled_box=False,
+    )
+    colors = color_component_segments(
+        arr,
+        foreground,
+        image_size,
+        scale,
+        color_segments,
+        min_area_ratio,
+        max_area_ratio,
+    )
+
+    emitted: set[str] = set()
+    for _area, segment in coarse + details + colors:
+        key = f"{round(segment['bbox']['x'])}:{round(segment['bbox']['y'])}:{round(segment['bbox']['width'])}:{round(segment['bbox']['height'])}"
+        if key in emitted:
+            continue
+        emitted.add(key)
+        yield segment
+
+def iter_prompt_segments(processor, state, prompt: str, threshold: float, image_size: tuple[int, int], min_area_ratio: float, max_area_ratio: float, log) -> Iterable[dict]:
+    output = processor.set_text_prompt(prompt=prompt, state=state)
+    masks = output.get("masks")
+    boxes = output.get("boxes")
+    scores = output.get("scores")
+
+    if masks is None or boxes is None:
+        log(f"[prompt={prompt}] no masks/boxes in output")
+        return
+
+    masks_np = to_numpy(masks)
+    boxes_np = to_numpy(boxes)
+    n = boxes_np.shape[0] if boxes_np.ndim >= 2 else 0
+    log(f"[prompt={prompt}] {n} candidate(s)")
+
+    target_w, target_h = image_size
+
+    for index in range(n):
+        score = score_at(scores, index)
+        if score < threshold:
+            log(f"  - skip idx={index} score={score:.3f} < {threshold}")
+            continue
+        try:
+            box = boxes_np[index]
+            mask = masks_np[index]
+            bbox = mask_bbox(mask, box)
+            ratio = area_ratio(bbox, image_size)
+            if ratio < min_area_ratio or ratio > max_area_ratio:
+                log(f"  - skip idx={index} area_ratio={ratio:.4f} outside [{min_area_ratio}, {max_area_ratio}]")
+                continue
+            yield {
+                "id": f"{prompt.replace(' ', '-')}-{index + 1}",
+                "label": prompt,
+                "score": score,
+                "source": "sam",
+                "bbox": bbox,
+                "maskDataUrl": mask_to_data_url(mask, target_w, target_h),
+            }
+        except Exception as exc:
+            log(f"  - error idx={index}: {exc}")
+
+
+def main() -> int:
+    args = parse_args()
+    input_path = Path(args.input_path or args.positional_input or "")
+    output_path = Path(args.output_path or args.positional_output or "")
+    if not input_path.is_file():
+        print(f"input path does not exist: {input_path}", file=sys.stderr)
+        return 2
+    if not output_path:
+        print("output path is required", file=sys.stderr)
+        return 2
+
+    def log(msg: str) -> None:
+        if args.debug:
+            print(msg, file=sys.stderr, flush=True)
+
+    t0 = time.time()
+    log(f"loading image: {input_path}")
+    image = Image.open(input_path).convert("RGB")
+    target_w, target_h = image.size
+    log(f"image size: {target_w}x{target_h}")
+
+    torch.set_grad_enabled(False)  # inference-only sidecar
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"loading sam3 model on {device} (weights cached after first run)...")
+    model = build_sam3_image_model()
+    if hasattr(model, "to"):
+        model = model.to(device)
+    if hasattr(model, "eval"):
+        model.eval()
+    processor = Sam3Processor(model, confidence_threshold=args.confidence_threshold)
+    log(f"model ready in {time.time()-t0:.1f}s")
+
+    t1 = time.time()
+    state = processor.set_image(image)
+    log(f"set_image done in {time.time()-t1:.2f}s")
+
+    candidates: list[dict] = []
+    prompts = [p.strip() for p in args.prompts.split(",") if p.strip()]
+    log(f"prompts: {prompts}")
+
+    for prompt in prompts:
+        for segment in iter_prompt_segments(
+            processor,
+            state,
+            prompt,
+            args.score_threshold,
+            (target_w, target_h),
+            args.min_area_ratio,
+            args.max_area_ratio,
+            log,
+        ):
+            candidates.append(segment)
+
+    if args.layout_segments > 0:
+        candidates.extend(iter_layout_segments(image, (target_w, target_h), args.layout_segments, args.layout_detail_segments, args.layout_color_segments, args.layout_distance_threshold, args.min_area_ratio, args.max_area_ratio))
+
+    segments = dedupe_segments(candidates, args.nms_iou, args.max_segments)
+    log(f"kept {len(segments)} of {len(candidates)} candidate(s) after NMS")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps({"segments": segments}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    log(f"wrote {len(segments)} segment(s) to {output_path} in {time.time()-t0:.1f}s total")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

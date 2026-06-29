@@ -18,10 +18,20 @@ import os
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Prefer the bundled Pretendard (Korean+Latin, OFL) so rendering is identical on
+# macOS, Linux/WSL, and Windows. System fonts remain as fallbacks if the bundled
+# asset is ever absent.
+_BUNDLED_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 KOREAN_FONT_CANDIDATES = [
+    (os.path.join(_BUNDLED_FONT_DIR, "Pretendard-Regular.otf"), 0),
+    # macOS system fonts
     ("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0),
     ("/System/Library/Fonts/Supplemental/AppleGothic.ttf", 0),
     ("/Library/Fonts/AppleSDGothicNeo.ttc", 0),
+    # Linux system Korean fonts (apt: fonts-nanum / fonts-noto-cjk)
+    ("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", 0),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+    ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
     ("/System/Library/Fonts/Helvetica.ttc", 0),
 ]
 SLIDE_H_PT = 540.0  # 7.5in * 72

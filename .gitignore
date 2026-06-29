@@ -54,3 +54,7 @@ next-env.d.ts
 
 # ad-hoc QA screenshots
 /btape-*.png
+
+# python bytecode (from sidecar compile checks)
+__pycache__/
+*.pyc

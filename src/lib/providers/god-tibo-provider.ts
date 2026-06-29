@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -101,7 +102,7 @@ async function attemptImageGeneration(
     baseUrl: 'https://chatgpt.com/backend-api/codex',
     session,
     prompt: options.prompt,
-    model: options.model ?? 'gpt-5.4',
+    model: options.model ?? 'gpt-5.5',
     originator: 'codex_cli_rs',
     images: options.images,
     ...(options.size ? { size: options.size } : {}),
@@ -205,4 +206,154 @@ export async function generateImage(options: GenerateImageOptions): Promise<stri
   }
 
   throw lastError instanceof Error ? lastError : new Error('Image generation failed');
+}
+
+export interface GenerateLayoutOptions {
+  prompt: string;
+  model?: string;
+  fetchImpl?: typeof fetch;
+  readFileImpl?: typeof readFile;
+}
+
+function extractAssistantText(items: unknown[]): string {
+  const texts: string[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const message = item as { type?: string; content?: unknown };
+    if (message.type !== 'message') continue;
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue;
+      const textPart = part as { type?: string; text?: unknown };
+      if (
+        typeof textPart.text === 'string'
+        && (textPart.type === 'output_text' || textPart.type === 'text')
+      ) {
+        texts.push(textPart.text);
+      }
+    }
+  }
+  return texts.join('').trim();
+}
+
+async function attemptLayoutGeneration(
+  options: GenerateLayoutOptions,
+  session: CodexSessionForRequest,
+): Promise<string> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const url = 'https://chatgpt.com/backend-api/codex/responses';
+  const body = {
+    model: options.model ?? 'gpt-5.5',
+    instructions: '',
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: options.prompt }],
+      },
+    ],
+    parallel_tool_calls: false,
+    reasoning: null,
+    store: false,
+    stream: true,
+    include: ['reasoning.encrypted_content'],
+  };
+
+  const response = await fetchImpl(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      'ChatGPT-Account-ID': session.accountId,
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      originator: 'codex_cli_rs',
+      session_id: randomUUID(),
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const failureText = await response.text();
+    const failureDetails = describeHttpFailureBody(failureText);
+    const error = new Error(
+      [
+        `Private Codex backend request failed with HTTP ${response.status}.`,
+        failureDetails ? `Backend error: ${failureDetails}.` : null,
+      ].filter(Boolean).join(' '),
+    );
+    (error as Error & { status?: number; body?: string }).status = response.status;
+    (error as Error & { status?: number; body?: string }).body = failureText;
+    throw error;
+  }
+
+  const responseBody = await response.text();
+  const trimmed = responseBody.trimStart();
+  const contentType = response.headers.get('content-type') ?? '';
+  const shouldParseAsSse =
+    contentType.includes('text/event-stream') ||
+    trimmed.startsWith('event:') ||
+    trimmed.startsWith('data:');
+
+  let parsed: ParsedSse;
+  if (shouldParseAsSse) {
+    parsed = parseSseText(responseBody) as ParsedSse;
+    for (const event of parsed.events) {
+      const data = event?.data as { type?: string; response?: { output?: unknown[] } } | undefined;
+      if (data?.type === 'response.completed' && Array.isArray(data.response?.output)) {
+        parsed.items.push(...data.response.output);
+      }
+    }
+  } else {
+    const payload = JSON.parse(responseBody);
+    parsed = {
+      events: [],
+      items: Array.isArray(payload?.output) ? payload.output : [],
+      responseId: payload?.id ?? null,
+    };
+  }
+
+  const text = extractAssistantText(parsed.items);
+  if (text) {
+    return text;
+  }
+
+  const backendError = describeBackendError(parsed);
+  const eventTypes = [...new Set(parsed.events.map((event) => {
+    const dataType = (event?.data as { type?: string } | undefined)?.type;
+    return dataType ?? event.event ?? 'unknown';
+  }))].join(', ');
+  const outputTypes = [...new Set(parsed.items.map((item) => {
+    const type = (item as { type?: string } | undefined)?.type;
+    return type ?? 'unknown';
+  }))].join(', ');
+  throw new Error(
+    [
+      'The response stream completed without an assistant message result.',
+      backendError ? `Backend error: ${backendError}.` : null,
+      eventTypes ? `Events: ${eventTypes}.` : null,
+      outputTypes ? `Output items: ${outputTypes}.` : null,
+    ].filter(Boolean).join(' '),
+  );
+}
+
+export async function generateLayout(options: GenerateLayoutOptions): Promise<string> {
+  const session = await loadAuthSession(options.readFileImpl ?? readFile);
+
+  const attempts = 2;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await attemptLayoutGeneration(options, session);
+    } catch (error) {
+      lastError = error;
+      const status = (error as Error & { status?: number })?.status;
+      const isTransient = typeof status === 'number' && status >= 500;
+      if (attempt === attempts - 1 || (status !== undefined && !isTransient)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('Layout generation failed');
 }

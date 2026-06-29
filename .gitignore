@@ -48,6 +48,9 @@ next-env.d.ts
 /.omx/
 /.sisyphus/
 /.playwright-mcp/
+/.agents/
+/.omc/
+/.scratch/
 
 # ad-hoc QA screenshots
 /btape-*.png

@@ -3,7 +3,12 @@ import path from 'node:path';
 import { nanoid } from 'nanoid';
 import type { Provider } from '@/types';
 import type { ProjectReferenceImage, ProjectResultType, PersistedImageResult } from './schema';
-import { appendHistoryEntry, appendProjectReference } from './metadata-store';
+import {
+  appendHistoryEntry,
+  appendProjectReference,
+  readProjectHistory,
+  readProjectSettings,
+} from './metadata-store';
 import { resolveInsideProject } from './paths';
 import { assertValidAssetId } from './validate';
 
@@ -86,4 +91,37 @@ export async function readAsset(projectRoot: string, assetId: string, assetPath:
   assertValidAssetId(assetId);
   const absolutePath = await resolveInsideProject(projectRoot, assetPath);
   return readFile(absolutePath);
+}
+
+/** Find an asset's stored relative path by id, looking in history then references. */
+export async function findAssetPath(projectRoot: string, assetId: string): Promise<string | null> {
+  const [history, settings] = await Promise.all([
+    readProjectHistory(projectRoot),
+    readProjectSettings(projectRoot),
+  ]);
+  const entry =
+    history.entries.find((item) => item.assetId === assetId)
+    ?? settings.referenceImages.find((item) => item.assetId === assetId);
+  return entry?.assetPath ?? null;
+}
+
+/** Resolve an asset id to its absolute on-disk path (for sidecars like OCR/SAM3). */
+export async function resolveAssetAbsolutePath(projectRoot: string, assetId: string): Promise<string> {
+  const assetPath = await findAssetPath(projectRoot, assetId);
+  if (!assetPath) throw new Error(`Asset not found: ${assetId}`);
+  assertValidAssetId(assetId);
+  return resolveInsideProject(projectRoot, assetPath);
+}
+
+/** Read an asset by id and return it as a base64 data URL (for god-tibo references). */
+export async function readAssetAsDataUrl(projectRoot: string, assetId: string): Promise<string> {
+  const assetPath = await findAssetPath(projectRoot, assetId);
+  if (!assetPath) throw new Error(`Asset not found: ${assetId}`);
+  const buffer = await readAsset(projectRoot, assetId, assetPath);
+  const ext = assetPath.split('.').pop()?.toLowerCase();
+  const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+    : ext === 'webp' ? 'image/webp'
+      : ext === 'gif' ? 'image/gif'
+        : 'image/png';
+  return `data:${mime};base64,${buffer.toString('base64')}`;
 }

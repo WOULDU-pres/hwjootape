@@ -60,6 +60,45 @@ bananatape stop <project>
 bananatape delete <project>
 ```
 
+## 덱 생성기 빠른 사용 (hwjootape)
+
+아웃라인(제목·불릿)을 주면 AI가 슬라이드를 디자인하고, **편집 가능한 .pptx + PNG**로 뽑아주는 기능입니다. `hwjootape`는 `bananatape`의 별칭이라 둘 다 똑같이 동작합니다.
+
+**한 번만 전역 설치:**
+
+```bash
+cd /path/to/bananatape
+npm link          # 어디서나 hwjootape / bananatape 사용 가능
+```
+
+**가장 쉬운 길 — 그냥 실행하면 메뉴가 뜹니다:**
+
+```bash
+hwjootape          # 덱 목록이 보이고, n=새로 만들기 / 숫자=열기 / q=종료
+```
+
+**한 방에 새 덱 만들고 편집기 열기:**
+
+```bash
+hwjootape new "내 덱"      # 생성 + 서버 실행 + 브라우저로 /deck 열기까지 한 번에
+```
+
+브라우저에서: 아웃라인 입력 → **1 초안 생성** → **2 승인 & 분해** → 미리보기에서 텍스트 직접 수정 → **3 Export**. 결과는 프로젝트 폴더의 `exports/`에 `.pptx`와 `.png`로 저장됩니다.
+
+**터미널만으로(헤드리스):** 아웃라인을 마크다운 파일로 두고
+
+```bash
+# outline.md 예시:
+#   # 2026년 사업 전략
+#   - 시장 점유율 확대
+#   - 신제품 라인 출시
+hwjootape deck "내 덱" outline.md --style "미니멀, 파란 액센트, 기업용"
+```
+
+`deck`은 프로젝트가 안 켜져 있으면 **자동으로 실행**한 뒤 진행합니다. 결과 `.pptx`/`.png` 경로를 출력합니다.
+
+> 참고: 이미지 생성은 `OPENAI_API_KEY`(OpenAI) 또는 Codex 로그인(`~/.codex/auth.json`, god-tibo)을 사용합니다. 아래 Provider setup 참고. 첫 분해 때 macOS Apple Silicon은 SAM3 모델(~4GB)을 한 번 받습니다.
+
 ## Provider setup
 
 BananaTape has two provider options in the editor.

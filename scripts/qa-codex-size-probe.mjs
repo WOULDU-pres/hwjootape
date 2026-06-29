@@ -81,7 +81,7 @@ function describeBackendError(events) {
 
 async function probeSize(size, auth, prompt) {
   const body = {
-    model: 'gpt-5.4',
+    model: 'gpt-5.5',
     instructions: '',
     input: [
       {

@@ -40,7 +40,8 @@
     "vitest": "^4.1.5"
   },
   "bin": {
-    "bananatape": "./bin/bananatape.mjs"
+    "bananatape": "./bin/bananatape.mjs",
+    "hwjootape": "./bin/bananatape.mjs"
   },
   "description": "Natural-language Photoshop for AI image models — a local-first vibe design canvas.",
   "keywords": [

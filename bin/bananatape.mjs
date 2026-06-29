@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
 const SCHEMA_VERSION = 1;
@@ -17,7 +18,8 @@ function registryPath() { return path.join(runtimeDir(), 'projects.json'); }
 function runtimePath() { return path.join(runtimeDir(), 'runtime.json'); }
 function nowIso() { return new Date().toISOString(); }
 function slugify(name) {
-  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+  // Unicode-aware: keep letters (incl. Korean/CJK) and numbers; everything else -> '-'.
+  const slug = name.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 63);
   if (!slug) throw new Error('Project name must include at least one letter or number.');
   return slug;
 }
@@ -118,6 +120,10 @@ function parseOptions(args) {
     else if (arg === '--rebuild') options.rebuild = true;
     else if (arg === '--delete-files') options.deleteFiles = true;
     else if (arg === '--all') options.all = true;
+    else if (arg === '--style') options.style = args[++i];
+    else if (arg === '--name') options.name = args[++i];
+    else if (arg === '--theme') options.theme = args[++i];
+    else if (arg === '--preset') options.preset = args[++i];
     else rest.push(arg);
   }
   return { options, rest };
@@ -229,6 +235,51 @@ async function launchProject(ref, options) {
   if (!options.noOpen) spawnBrowser(url);
   console.log(`Launched ${project.id} at http://127.0.0.1:${port}`);
 }
+const HUB_ID = '__hub__';
+
+// Single-hub server: serves the deck dashboard for ALL projects (project chosen
+// per-request via ?project=<id>), so no BANANATAPE_ACTIVE_PROJECT_PATH is set.
+async function launchHub(options) {
+  const runtime = await cleanupRuntime();
+  const existing = runtime.running.find((entry) => entry.projectId === HUB_ID);
+  if (existing && !options.port) {
+    const url = `http://127.0.0.1:${existing.port}/decks`;
+    if (!options.noOpen) spawnBrowser(url);
+    console.log(`Hub already running at ${url}`);
+    return;
+  }
+  if (options.rebuild || !(await buildExists())) {
+    console.log('Building BananaTape...');
+    await new Promise((resolve, reject) => {
+      const child = spawn('npm', ['run', 'build'], { cwd: APP_ROOT, stdio: 'inherit' });
+      child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error('Build failed'))));
+    });
+  }
+  const port = await findFreePort(options.port);
+  const launchId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const hasStandaloneServer = await standaloneServerExists();
+  if (hasStandaloneServer) await prepareStandaloneServer();
+  const child = hasStandaloneServer
+    ? spawn(process.execPath, [path.join(APP_ROOT, '.next', 'standalone', 'server.js')], {
+      cwd: APP_ROOT,
+      env: { ...process.env, HOSTNAME: '127.0.0.1', PORT: String(port), BANANATAPE_LAUNCH_ID: launchId },
+      stdio: ['ignore', 'ignore', 'ignore'],
+      detached: true,
+    })
+    : spawn('npm', ['run', 'start', '--', '--hostname', '127.0.0.1', '--port', String(port)], {
+      cwd: APP_ROOT,
+      env: { ...process.env, BANANATAPE_LAUNCH_ID: launchId },
+      stdio: ['ignore', 'ignore', 'ignore'],
+      detached: true,
+    });
+  child.unref();
+  runtime.running.push({ projectId: HUB_ID, projectPath: '', port, pid: child.pid, launchId, startedAt: nowIso() });
+  await writeRuntime(runtime);
+  const url = `http://127.0.0.1:${port}/decks`;
+  if (!options.noOpen) spawnBrowser(url);
+  console.log(`Hub running at ${url}`);
+}
+
 async function stopProject(ref, options) {
   const runtime = await readRuntime();
   const keep = [];
@@ -241,19 +292,188 @@ async function stopProject(ref, options) {
   }
   await writeRuntime({ schemaVersion: SCHEMA_VERSION, running: keep });
 }
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status} from ${url}`);
+  return data;
+}
+
+// Minimal outline parser for the CLI (first slide only); mirrors src/lib/slides/deck.ts.
+function parseOutlineMarkdown(md) {
+  const title = [];
+  const bullets = [];
+  for (const raw of md.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^---+$/.test(line)) break;
+    const heading = line.match(/^#{1,6}\s+(.*\S)/);
+    if (heading) { if (!title.length) title.push(heading[1]); else bullets.push(heading[1]); continue; }
+    const bullet = line.match(/^(?:[-*•]|\d+[.)])\s+(.*\S)/);
+    if (bullet) { bullets.push(bullet[1]); continue; }
+    if (!title.length) title.push(line); else bullets.push(line);
+  }
+  return { title: title[0] || '', bullets };
+}
+
+async function waitForServer(url, timeoutMs = 90000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try { const response = await fetch(url); if (response.ok || response.status === 404) return; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error(`Server did not become ready within ${Math.round(timeoutMs / 1000)}s: ${url}`);
+}
+
+async function deckCommand(ref, file, options) {
+  if (!ref || !file) throw new Error('Usage: bananatape deck <project> <outline.md> [--preset <id>] [--style <hint>] [--name <basename>]');
+  const project = await resolveProject(ref);
+  let runtime = await cleanupRuntime();
+  let entry = runtime.running.find((item) => item.projectId === project.id);
+  if (!entry) {
+    console.log(`${project.id} is not running — launching it...`);
+    await launchProject(project.id, { noOpen: true });
+    runtime = await cleanupRuntime();
+    entry = runtime.running.find((item) => item.projectId === project.id);
+    if (!entry) throw new Error(`Failed to launch ${project.id}.`);
+    process.stdout.write('Waiting for the editor server to be ready');
+    await waitForServer(`http://127.0.0.1:${entry.port}/deck`);
+    console.log(' ready.');
+  }
+  const base = `http://127.0.0.1:${entry.port}`;
+  // Thread the project id into every API call (single-hub model resolves the
+  // deck via ?project=<id>; harmless under the per-project launch model too).
+  const api = (p) => `${base}${p}?project=${encodeURIComponent(project.id)}`;
+  const outlineText = await fs.readFile(path.resolve(file), 'utf8');
+  if (!outlineText.trim()) throw new Error(`Outline file is empty: ${file}`);
+
+  // The web flow lets the user pick from N visual versions; the CLI is headless, so it
+  // bakes ONE chosen style preset (default 'minimal', override with --preset <id>).
+  const presetId = options.preset || 'minimal';
+
+  // 1. Versions: render the chosen preset's sample slides (the picker's input).
+  console.log(`Generating sample design for preset "${presetId}" (god-tibo, may take a while)...`);
+  const versionsRes = await postJson(api('/api/slides/versions'), {
+    outlineText,
+    styleHint: options.style,
+    presetIds: [presetId],
+  });
+  const chosen = (versionsRes.versions || [])[0];
+  if (!chosen) throw new Error(`No version produced for preset "${presetId}".`);
+  const samples = {};
+  for (const sm of chosen.samples || []) if (sm.assetId) samples[sm.slideIndex] = sm.assetId;
+
+  // 2. Full deck: render the remaining slides in the chosen look (samples as references).
+  console.log('Generating the full deck in that style...');
+  const deckRes = await postJson(api('/api/slides/full-deck'), {
+    outlineText,
+    presetId,
+    styleHint: options.style,
+    samples,
+  });
+  const slides = (deckRes.slides || []).filter((s) => s.assetId).map((s) => ({ slideIndex: s.slideIndex, assetId: s.assetId }));
+  console.log(`Generated ${slides.length} slide image(s).`);
+
+  // 3. Decompose: OCR + gpt-5.5 mapping + background/object regen → editable specs.
+  console.log('Decomposing into editable elements (OCR + SAM3 + gpt-5.5)...');
+  const decomposed = await postJson(api('/api/slides/decompose-deck'), {
+    outlineText,
+    styleHint: options.style,
+    slides,
+  });
+
+  // 4. Export: render the final deck to editable pptx + per-slide png.
+  console.log(`Exporting (${decomposed.deck.length} slide(s))...`);
+  const exported = await postJson(api('/api/slides/export'), {
+    deck: decomposed.deck,
+    baseName: options.name || 'deck',
+  });
+  console.log(`\nDone (${exported.slideCount} slide(s)):\n  pptx: ${exported.pptxPath}`);
+  for (const png of exported.pngPaths) console.log(`  png:  ${png}`);
+  console.log(`  exports: ${path.dirname(exported.pptxPath)}`);
+}
+
+async function newCommand(name, options) {
+  if (!name) throw new Error('Usage: hwjootape new <name>');
+  await createProject(name, options);
+  const id = slugify(name);
+  // Create on the single hub, then open the new deck's builder there.
+  await launchHub({ ...options, noOpen: true });
+  const runtime = await cleanupRuntime();
+  const hub = runtime.running.find((entry) => entry.projectId === HUB_ID);
+  if (!hub) throw new Error('Failed to start the hub server.');
+  const url = `http://127.0.0.1:${hub.port}/deck?project=${encodeURIComponent(id)}`;
+  if (!options.noOpen) spawnBrowser(url);
+  console.log(`Opened ${id} at ${url}`);
+}
+
+async function ask(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(question)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+async function interactiveMenu() {
+  const [registry, runtime] = await Promise.all([readRegistry(), cleanupRuntime()]);
+  const projects = registry.projects;
+  console.log('\n  🍌  hwjootape — AI 덱 생성기\n');
+  if (projects.length === 0) {
+    console.log('  아직 덱이 없습니다.');
+  } else {
+    console.log('  덱 목록:');
+    projects.forEach((project, index) => {
+      const running = runtime.running.find((entry) => entry.projectId === project.id);
+      const status = running ? `실행 중 · http://127.0.0.1:${running.port}` : '중지됨';
+      console.log(`    ${index + 1}. ${project.id}  (${status})`);
+    });
+  }
+  console.log('\n    n. 새로 만들기');
+  console.log('    q. 종료\n');
+
+  if (!process.stdin.isTTY) {
+    console.log('  (대화형 입력 불가 — `hwjootape new "이름"` 또는 `hwjootape launch <덱>`을 쓰세요.)');
+    return;
+  }
+
+  const choice = await ask('  선택> ');
+  if (!choice || choice === 'q') return;
+  if (choice === 'n') {
+    const name = await ask('  새 덱 이름> ');
+    if (!name) { console.log('  취소했습니다.'); return; }
+    return newCommand(name, {});
+  }
+  const index = Number(choice) - 1;
+  if (Number.isInteger(index) && projects[index]) {
+    return launchProject(projects[index].id, {});
+  }
+  console.log('  알 수 없는 선택입니다.');
+}
+
 function usage() {
-  console.log(`BananaTape CLI\n\nCommands:\n  bananatape create <name> [--dir <parent>]\n  bananatape list\n  bananatape launch <project> [--port <port>] [--no-open] [--rebuild]\n  bananatape open <project>\n  bananatape status [project]\n  bananatape stop <project|--all>\n  bananatape delete <project> [--delete-files]`);
+  console.log(`hwjootape / bananatape\n\nRun with no command to open the web dashboard (덱 목록 + 새로 만들기).\n\nCommands:\n  hwjootape                             open the deck dashboard in your browser (hub)\n  hwjootape new <name>                  create a deck and open its builder in one step\n  hwjootape menu                        text-only menu (for headless terminals)\n  hwjootape create <name> [--dir <parent>]\n  hwjootape list\n  hwjootape launch <project> [--port <port>] [--no-open] [--rebuild]\n  hwjootape open <project>\n  hwjootape status [project]\n  hwjootape stop <project|--all>\n  hwjootape delete <project> [--delete-files]\n  hwjootape deck <project> <outline.md> [--preset <id>] [--style <hint>] [--name <basename>]\n        (auto-launches the project if it is not already running)`);
 }
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   const { options, rest } = parseOptions(args);
-  if (!command || command === 'help' || command === '--help') return usage();
+  if (command === 'help' || command === '--help') return usage();
+  if (!command) return launchHub(options);
+  if (command === 'hub') return launchHub(options);
+  if (command === 'menu') return interactiveMenu();
+  if (command === 'new') return newCommand(rest.join(' '), options);
   if (command === 'create') return createProject(rest.join(' '), options);
   if (command === 'list') return listProjects();
   if (command === 'launch' || command === 'open') return launchProject(rest[0], options);
   if (command === 'status') return status(rest[0]);
   if (command === 'stop') return stopProject(rest[0], options);
   if (command === 'delete') return deleteProject(rest[0], options);
+  if (command === 'deck') return deckCommand(rest[0], rest[1], options);
   throw new Error(`Unknown command: ${command}`);
 }
 
